@@ -309,6 +309,7 @@ void level_build_from_ascii(const char **rows, int nrows) {
             else if (c == 'y') lock = LOCK_YELLOW;
             else if (c == 'r') lock = LOCK_RED;
             else if (c == 'x') lock = LOCK_EXIT;
+            else if (c == 'X') lock = LOCK_VAULT;
             if (lock < 0 || L.door_id[y][x] >= 0 || L.ndoors >= MAX_DOORS) continue;
             Door *d = &L.doors[L.ndoors];
             memset(d, 0, sizeof(*d));

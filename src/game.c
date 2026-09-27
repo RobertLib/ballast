@@ -23,6 +23,14 @@ static const float DIFF_COUNTDOWN[5] = {50, 45, 40, 35, 30};
 static const int DIFF_START_CONC[5] = {7, 6, 5, 4, 3};
 static const float DIFF_ORB[5] = {30, 26, 22, 19, 16};
 static const int MAX_MISSILES[SW_COUNT] = {20, 10, 10, 6, 5};
+static int max_missiles(int s) { return (int)(MAX_MISSILES[s] * mod_missile_cap() + 0.5f); }
+int game_missile_cap(int s) { return max_missiles(clampi(s, 0, SW_COUNT - 1)); }
+int g_proj_src = DS_UNKNOWN;
+static int hit_proj = -1; /* the projectile type behind the next player_damage, for the death recap */
+/* detonator rounds: wrecks waiting to explode, a beat apart so the chain can be seen */
+static V2 det_pos[32];
+static float det_t[32];
+static int ndet = 0;
 static const float LASER_DMG[5] = {0, 10, 12.5f, 15, 18};
 static const Col LASER_COL[5] = {{1, 1, 1, 1}, {1, 0.3f, 0.25f, 1}, {0.8f, 0.35f, 1, 1}, {0.35f, 0.65f, 1, 1}, {0.35f, 1, 0.45f, 1}};
 
@@ -41,6 +49,7 @@ static const ProjInfo PINFO[PR_TYPES] = {
     [PR_SMART] = {6, 90, 0, {1, 0.4f, 1, 1}},
     [PR_BLOB] = {6, 34, 0, {1, 0.5f, 0.9f, 1}},
     [PR_MEGA] = {9, 220, 0, {1, 0.35f, 0.2f, 1}},
+    [PR_CARGO] = {11, 0, 0, {1, 0.62f, 0.2f, 1}},
     [EP_PULSE] = {6, 0, 0, {1, 0.45f, 0.2f, 1}},
     [EP_BOLT] = {4, 0, 0, {0.3f, 0.95f, 1, 1}},
     [EP_NEEDLE] = {3, 0, 0, {1, 0.6f, 0.95f, 1}},
@@ -50,24 +59,24 @@ static const ProjInfo PINFO[PR_TYPES] = {
     [EP_MINE] = {9, 65, 8, {1, 0.9f, 0.2f, 1}},
     [EP_ORB] = {9, 0, 6, {1, 0.25f, 0.45f, 1}},
     [EP_REACTOR] = {6, 0, 0, {0.8f, 0.6f, 1, 1}},
+    [EP_PELLET] = {5, 0, 0, {1, 0.4f, 0.6f, 1}},
+    [EP_SHARD] = {4, 0, 0, {1, 0.7f, 0.3f, 1}},
+    [EP_FLAK] = {11, 0, 8, {1, 0.7f, 0.25f, 1}},
+    [EP_SEEKER] = {9, 0, 12, {1, 0.3f, 0.5f, 1}},
 };
 
-const LevelDef *cur_def(void) { return &LEVELS[G.level]; }
+const LevelDef *cur_def(void) { return run_level_def(); }
 
-#define BASE_ZOOM 0.92f
+#define BASE_ZOOM 0.88f
+#define ARENA_ZOOM 0.74f
+/* the eye trails the camera's motion off straight overhead: the walls lean into it and show their sides */
+#define LEAN_LAG 0.075f  /* eye offset per unit of camera speed */
+#define LEAN_MAX 46.0f
+#define WALL_LEAN 0.4f   /* how far the tops of the walls shift per unit of eye offset */
 
 bool in_view(V2 p, float margin) {
     V2 v = w2v(p);
     return v.x > -margin && v.x < g_virt_w + margin && v.y > -margin && v.y < VIRT_H + margin;
-}
-int game_level_count(void) { return NUM_LEVELS; }
-const char *game_level_name(int i) { return LEVELS[i].name; }
-const char *game_level_subtitle(int i) { return LEVELS[i].subtitle; }
-const char *game_level_briefing(int i) { return LEVELS[i].briefing; }
-int game_level_threats(int i, int *types, int max) {
-    int n = LEVELS[i].nthreats < max ? LEVELS[i].nthreats : max;
-    for (int k = 0; k < n; k++) types[k] = LEVELS[i].threats[k];
-    return n;
 }
 const char *game_robot_name(int type) { return RDEF[type].name; }
 
@@ -77,6 +86,7 @@ Col key_color(int lock) {
     case LOCK_YELLOW: return rgba(1.0f, 0.85f, 0.2f, 1);
     case LOCK_RED: return rgba(1.0f, 0.25f, 0.25f, 1);
     case LOCK_EXIT: return G.reactor_dead ? rgba(0.3f, 1.0f, 0.4f, 1) : rgba(1.0f, 0.3f, 0.3f, 1);
+    case LOCK_VAULT: return G.reactor_dead ? rgba(1.0f, 0.75f, 0.25f, 1) : rgba(0.75f, 0.45f, 0.18f, 1);
     default: return cur_def()->accent;
     }
 }
@@ -108,7 +118,8 @@ void game_draw_ship_icon(V2 pos, float ang, float scale, Col c) { r_shape(&SHIP_
 
 /* ------------------------------------------------------------ score */
 void game_add_score(int pts) {
-    G.score += pts;
+    /* threat protocols pay 10% more score per heat */
+    G.score += pts * (10 + run_heat()) / 10;
     while (G.score >= G.next_life) {
         G.lives++;
         G.next_life += 50000;
@@ -121,6 +132,8 @@ void chain_kill(V2 pos, int points) {
     G.chain++;
     G.chain_t = 3.2f;
     int mult = 1 + (G.chain - 1 < 28 ? G.chain - 1 : 28) / 4;
+    if (mult > R.best_chain) R.best_chain = mult;
+    if (mult >= 8) profile_complete(CH_CHAIN);
     int pts = points * mult;
     game_add_score(pts);
     char buf[24];
@@ -132,26 +145,80 @@ void chain_kill(V2 pos, int points) {
 /* ------------------------------------------------------------ loadout */
 static void reset_loadout(void) {
     Player *p = &W.pl;
-    p->shield = 100;
-    p->energy = 100;
+    p->shield = mod_start_shield();
+    p->energy = mod_start_energy();
     p->burner = 1;
     p->primary = PW_LASER;
-    p->owned = 1 << PW_LASER;
-    p->laser_level = 1;
-    p->quad = false;
-    p->vulcan_ammo = 0;
-    memset(p->missiles, 0, sizeof(p->missiles));
-    p->missiles[SW_CONCUSSION] = DIFF_START_CONC[G.difficulty];
+    p->special = -1;
+    p->laser_level = mod_base_laser();
+    p->quad = mod_on(MOD_QUAD);
     p->secondary = SW_CONCUSSION;
+    p->missiles = clampi(DIFF_START_CONC[G.difficulty] + mod_start_missiles(), 0, max_missiles(SW_CONCUSSION));
+    p->cargo = 0;
+    p->mass = 1;
 }
 
-void game_new(int difficulty) {
+/* per-ship state of the upgrade modules */
+static void reset_modules(void) {
+    Player *p = &W.pl;
+    p->calm_t = 0;
+    p->reactive_cd = 0;
+    p->phase_t = p->phase_cd = 0;
+    p->was_burning = false;
+    p->drone_cd = 1.0f;
+    p->jettison_cd = 0;
+    p->swap_pu = -1;
+    p->fab_kills = 0;
+}
+
+void game_new(int difficulty, int lives) {
     memset(&G, 0, sizeof(G));
     G.difficulty = clampi(difficulty, 0, 4);
-    G.lives = 3;
+    G.lives = lives;
     G.next_life = 50000;
+    G.level_score_start = -1;
     memset(&W.pl, 0, sizeof(W.pl));
     reset_loadout();
+}
+
+void game_debug_loadout(void) {
+    Player *p = &W.pl;
+    p->special = PW_FUSION;
+    p->laser_level = 4;
+    p->quad = true;
+    p->secondary = SW_HOMING;
+    p->missiles = 10;
+    p->keys = 7;
+}
+
+/* ------------------------------------------------------------ campaign save */
+void game_save(FILE *f) {
+    const Player *p = &W.pl;
+    fprintf(f, "difficulty %d\nlives %d\nscore %d\nnext_life %d\nlevel_score %d\n", G.difficulty, G.lives, G.score, G.next_life,
+            G.level_score_start);
+    /* special comes before primary: game_load_line checks the primary against it */
+    fprintf(f, "shield %.1f\nenergy %.1f\nspecial %d\nprimary %d\nlaser %d\nquad %d\nsecondary %d\nmissiles %d\n", p->shield, p->energy,
+            p->special, p->primary, p->laser_level, p->quad, p->secondary, p->missiles);
+}
+
+bool game_load_line(const char *key, const char *val) {
+    Player *p = &W.pl;
+    int v = atoi(val);
+    if (!strcmp(key, "difficulty")) G.difficulty = clampi(v, 0, 4);
+    else if (!strcmp(key, "lives")) G.lives = clampi(v, 0, 99);
+    else if (!strcmp(key, "score")) G.score = v > 0 ? v : 0;
+    else if (!strcmp(key, "next_life")) G.next_life = v > 0 ? v : 50000;
+    else if (!strcmp(key, "level_score")) G.level_score_start = v; /* -1: the first mine still launches a fresh ship */
+    else if (!strcmp(key, "shield")) p->shield = maxf(0, (float)atof(val));
+    else if (!strcmp(key, "energy")) p->energy = maxf(0, (float)atof(val));
+    else if (!strcmp(key, "special")) p->special = v > PW_LASER && v < PW_COUNT ? v : -1;
+    else if (!strcmp(key, "primary")) p->primary = v == p->special && v >= 0 ? v : PW_LASER;
+    else if (!strcmp(key, "laser")) p->laser_level = clampi(v, 1, 4);
+    else if (!strcmp(key, "quad")) p->quad = v != 0;
+    else if (!strcmp(key, "secondary")) p->secondary = clampi(v, -1, SW_COUNT - 1);
+    else if (!strcmp(key, "missiles")) p->missiles = v > 0 ? v : 0;
+    else return false;
+    return true;
 }
 
 void game_shutdown_level(void) {
@@ -172,22 +239,33 @@ void game_init(void) {
     shape_ready = true;
 }
 
-void game_start_level(int lvl, bool fresh_ship) {
+void game_start_level(bool fresh_ship) {
     game_init();
     game_shutdown_level();
-    G.level = clampi(lvl, 0, NUM_LEVELS - 1);
+    G.level = R.layer;
     const LevelDef *d = cur_def();
     level_build_from_ascii(d->map, d->rows);
+    float tier = run_tier();
 
     Player keep = W.pl;
     memset(&W, 0, sizeof(W));
     W.pl = keep;
     W.boss_idx = -1;
+    W.blast_kills = -1;
+    W.last_src = DS_UNKNOWN;
+    W.last_proj = -1;
+    ndet = 0;
     if (fresh_ship) reset_loadout();
     else {
-        W.pl.shield = maxf(W.pl.shield, 100);
-        W.pl.energy = maxf(W.pl.energy, 100);
+        /* the ship carries over, but never launches below what its modules provide */
+        W.pl.shield = maxf(W.pl.shield, mod_start_shield());
+        W.pl.energy = maxf(W.pl.energy, mod_start_energy());
+        W.pl.laser_level = clampi(W.pl.laser_level, mod_base_laser(), 4);
+        if (mod_on(MOD_QUAD)) W.pl.quad = true;
+        W.pl.cargo = 0;
     }
+    reset_modules();
+    if (mod_on(MOD_MAPPER)) memset(L.explored, 1, sizeof(L.explored));
     Player *p = &W.pl;
     p->keys = 0;
     p->vel = v2(0, 0);
@@ -199,6 +277,7 @@ void game_start_level(int lvl, bool fresh_ship) {
     p->charging = false;
     p->burner = 1;
     p->hit_flash = 0;
+    p->mass = 1;
 
     grid_init(L.w * TILE, L.h * TILE, 32);
     fx_clear();
@@ -211,6 +290,7 @@ void game_start_level(int lvl, bool fresh_ship) {
     G.hostages_total = 0;
     G.hostages_onboard = 0;
     G.hostages_lost = 0;
+    G.hostages_saved = 0;
     G.robots_killed = 0;
     G.robots_total = 0;
     G.level_time = 0;
@@ -221,10 +301,20 @@ void game_start_level(int lvl, bool fresh_ship) {
     G.automap_pan = v2(0, 0);
     G.result = GR_NONE;
     G.level_score_start = G.score;
+    G.cargo_banked = G.cargo_bonus = 0;
+    G.escape_margin = 0;
+    G.ram_kills = G.best_bomb = 0;
     G.boss_level = false;
+    int hazard = run_hazard();
+    const SectorNode *node = run_cur_node();
+    W.seed = node ? node->seed : 0;
+    backdrop_init(W.seed ^ (uint32_t)(G.level * 0x9E3779B9u), node ? node->zone : 0, L.w * TILE, L.h * TILE);
+    float elite_p = clampf(0.03f + 0.05f * G.level + 0.03f * run_protocol(TP_ELITE), 0, 0.4f);
 
     V2 exit_sum = v2(0, 0);
     int exit_n = 0;
+    static V2 treasure[32];
+    int ntreasure = 0;
     for (int y = 0; y < d->rows && y < L.h; y++) {
         const char *row = d->map[y];
         int len = (int)strlen(row);
@@ -245,12 +335,7 @@ void game_start_level(int lvl, bool fresh_ship) {
             case '1': spawn_powerup(PU_KEY_BLUE, pos, v2(0, 0), 1); W.level_keys |= 1; break;
             case '2': spawn_powerup(PU_KEY_YELLOW, pos, v2(0, 0), 1); W.level_keys |= 2; break;
             case '3': spawn_powerup(PU_KEY_RED, pos, v2(0, 0), 1); W.level_keys |= 4; break;
-            case 'C':
-                W.reactor.exists = true;
-                W.reactor.pos = pos;
-                W.reactor.maxhp = W.reactor.hp = (900.0f + 400.0f * G.level) * DIFF_HP[G.difficulty];
-                W.reactor.fire_cd = 2.0f;
-                break;
+            case 'C': reactor_init(pos); break;
             case 'W': {
                 Robot *r = robot_spawn(RB_BOSS, pos, false);
                 if (r) { W.boss_idx = (int)(r - W.rob); G.boss_level = true; }
@@ -259,8 +344,9 @@ void game_start_level(int lvl, bool fresh_ship) {
                 if (W.nmat < MAX_MATCENS) {
                     Matcen *m = &W.mat[W.nmat++];
                     m->pos = pos;
-                    m->max = 3 + G.difficulty / 2 + G.level;
+                    m->max = 3 + G.difficulty / 2 + (int)tier + (run_protocol(TP_SWARM) ? 2 : 0) + (hazard == HZ_OVERCLOCK ? 3 : 0);
                     m->timer = 1.0f;
+                    if (hazard == HZ_OVERCLOCK) m->triggered = true;
                 }
                 break;
             case 'd': robot_spawn(RB_DRONE, pos, false); break;
@@ -272,12 +358,26 @@ void game_start_level(int lvl, bool fresh_ship) {
             case 'v': robot_spawn(RB_DRILLER, pos, false); break;
             case 'u': robot_spawn(RB_SUPERHULK, pos, false); break;
             case 'c': robot_spawn(RB_CLOAKER, pos, false); break;
+            case 'a': robot_spawn(RB_WASP, pos, false); break;
+            case 'P': robot_spawn(RB_PULSAR, pos, false); break;
+            case 'k': robot_spawn(RB_LANCER, pos, false); break;
+            case 'B': robot_spawn(RB_BOMBER, pos, false); break;
+            case 'q': robot_spawn(RB_CARRIER, pos, false); break;
+            case '~': trap_add(TR_VENT, x, y); break;
+            case '=': trap_add(TR_GATE, x, y); break;
+            case 'O': trap_add(TR_SWEEPER, x, y); break;
+            case 'Y': trap_add(TR_WELL, x, y); break;
+            case 'n': {
+                g_proj_src = DS_TRAP;
+                Proj *m = spawn_proj(EP_MINE, pos, v2(0, 0), 16, 1e9f);
+                if (m) m->age = 1;
+                g_proj_src = DS_UNKNOWN;
+            } break;
             case '+': spawn_powerup(PU_SHIELD, pos, v2(0, 0), 1); break;
-            case '*': spawn_powerup(PU_ENERGY, pos, v2(0, 0), 1); break;
+            case '*': case 'A': spawn_powerup(PU_ENERGY, pos, v2(0, 0), 1); break;
             case 'L': spawn_powerup(PU_LASER, pos, v2(0, 0), 1); break;
             case 'Q': spawn_powerup(PU_QUAD, pos, v2(0, 0), 1); break;
-            case 'V': spawn_powerup(PU_VULCAN, pos, v2(0, 0), 1200); break;
-            case 'A': spawn_powerup(PU_VAMMO, pos, v2(0, 0), 600); break;
+            case 'V': spawn_powerup(PU_VULCAN, pos, v2(0, 0), 1); break;
             case 'N': spawn_powerup(PU_SPREAD, pos, v2(0, 0), 1); break;
             case 'J': spawn_powerup(PU_PLASMA, pos, v2(0, 0), 1); break;
             case 'F': spawn_powerup(PU_FUSION, pos, v2(0, 0), 1); break;
@@ -289,19 +389,52 @@ void game_start_level(int lvl, bool fresh_ship) {
             case 'I': spawn_powerup(PU_INVULN, pos, v2(0, 0), 1); break;
             case 'K': spawn_powerup(PU_CLOAK, pos, v2(0, 0), 1); break;
             case 'U': spawn_powerup(PU_LIFE, pos, v2(0, 0), 1); break;
+            case 'R': spawn_powerup(PU_CRATE, pos, v2(0, 0), 1); break;
+            case '$': {
+                /* a salvage cache: one big shard */
+                spawn_powerup(PU_SALVAGE, pos, v2(0, 0), (int)((9 + 3 * tier) * run_salvage_mult() * mod_salvage_mult() + 0.5f));
+            } break;
+            case '@': if (ntreasure < 32) treasure[ntreasure++] = pos; break;
             case 'Z': exit_sum = v2add(exit_sum, pos); exit_n++; break;
             default: break;
             }
         }
     }
     if (exit_n) W.exit_pos = v2scale(exit_sum, 1.0f / exit_n);
+    for (int i = 0; i < L.ndoors; i++) W.nvaults += L.doors[i].lock == LOCK_VAULT;
+    /* vault treasure pays by the distance to the exit: the deeper, the richer */
+    if (ntreasure) {
+        int xs[64], ys[64], n = 0;
+        for (int y = 0; y < L.h; y++)
+            for (int x = 0; x < L.w; x++)
+                if ((L.flags[y][x] & TF_EXIT) && n < 64) { xs[n] = x; ys[n] = y; n++; }
+        flow_compute_multi(L.exitflow, xs, ys, n, true);
+        for (int i = 0; i < ntreasure; i++) {
+            int tx = tx_of(treasure[i].x), ty = tx_of(treasure[i].y);
+            int dist = L.exitflow[ty][tx] < 60000 ? L.exitflow[ty][tx] : 40;
+            int amount = (int)((25 + dist * 0.9f) * (1 + 0.15f * tier) * run_salvage_mult() * mod_salvage_mult() + 0.5f);
+            spawn_powerup(PU_TREASURE, treasure[i], v2(0, 0), amount);
+        }
+    }
     p->pos = p->start;
-    for (int i = 0; i < MAX_ROBOTS; i++)
-        if (W.rob[i].active) G.robots_total++;
+    for (int i = 0; i < MAX_ROBOTS; i++) {
+        Robot *r = &W.rob[i];
+        if (!r->active) continue;
+        G.robots_total++;
+        /* elites: the same ones for everyone who flies this seed */
+        int tx = tx_of(r->pos.x), ty = tx_of(r->pos.y);
+        uint32_t h = hash32(W.seed ^ (uint32_t)tx * 73856093u ^ (uint32_t)ty * 19349663u ^ 0xE11Eu);
+        if (r->type != RB_BOSS && r->type != RB_TURRET && (h >> 8) * (1.0f / 16777216.0f) < elite_p) {
+            r->elite = true;
+            r->maxhp = r->hp = r->maxhp * 1.8f;
+            r->radius *= 1.15f;
+        }
+    }
 
     flow_compute(L.flow, tx_of(p->pos.x), tx_of(p->pos.y), false);
     explore_update(p->pos, 420);
     g_cam.pos = p->pos;
+    g_cam.lean = v2(0, 0);
     g_cam.zoom = 0.6f;
     W.zoom_target = BASE_ZOOM;
     W.time_scale = 1.0f;
@@ -310,8 +443,12 @@ void game_start_level(int lvl, bool fresh_ship) {
     music_play(d->song);
 
     char buf[96];
-    snprintf(buf, sizeof(buf), "MINE %d: %s", G.level + 1, d->name);
+    snprintf(buf, sizeof(buf), "SECTOR %d: %s", G.level + 1, d->name);
     hud_msg(buf, d->accent);
+    if (hazard) {
+        snprintf(buf, sizeof(buf), "HAZARD: %s", hazard_name(hazard));
+        hud_msg(buf, C_ORANGE);
+    }
     fx_ring(p->pos, 10, 90, rgba(0.6f, 0.9f, 1, 1), 0.8f, 6);
 }
 
@@ -334,6 +471,7 @@ Proj *spawn_proj(int type, V2 pos, V2 vel, float dmg, float life) {
         p->hp = PINFO[type].hp;
         p->col = PINFO[type].col;
         p->target = -1;
+        p->src = IS_ENEMY_PROJ(type) ? g_proj_src : DS_SELF;
         return p;
     }
     return NULL;
@@ -354,6 +492,7 @@ static void break_tile(int x, int y) {
     shake_add(0.25f);
     level_rebuild_geometry();
     flow_compute(L.flow, tx_of(W.pl.pos.x), tx_of(W.pl.pos.y), false);
+    spawn_salvage(c, 12, 220);
     if (W.time >= W.secret_msg_next) {
         hud_msg("SECRET PASSAGE OPENED!", ac);
         W.secret_msg_next = W.time + 3;
@@ -368,7 +507,7 @@ static void damage_tile(int tile, float dmg) {
     if (L.break_hp[y][x] <= 0) break_tile(x, y);
 }
 
-void explode(V2 pos, float radius, float dmg, bool by_player, int exclude, Col c) {
+void explode(V2 pos, float radius, float dmg, bool by_player, int exclude, Col c, int src) {
     fx_explosion(pos, radius * 0.45f, c);
     int snd = radius < 90 ? SND_EXPL_S : radius < 170 ? SND_EXPL_M : SND_EXPL_L;
     snd_play_at(snd, pos, 0.85f, frandr(0.9f, 1.1f));
@@ -384,15 +523,15 @@ void explode(V2 pos, float radius, float dmg, bool by_player, int exclude, Col c
         robot_damage(r, dmg * 0.7f * f, v2norm(v2sub(r->pos, pos)), by_player);
     }
     if (W.reactor.exists && !W.reactor.dead && by_player) {
-        float d = v2dist(W.reactor.pos, pos) - 44;
+        float d = v2dist(W.reactor.pos, pos) - REACTOR_R;
         if (d < radius) reactor_damage(dmg * 0.7f * (1 - maxf(0, d) / radius));
     }
-    if (!W.pl.dead && !G.escaping) {
+    if (!W.pl.dead && !G.escaping && src != DS_SAFE) {
         float d = pd - W.pl.radius;
         if (d < radius && (los(pos, W.pl.pos) || d < 8)) {
             float f = 1 - maxf(0, d) / radius;
             float k = by_player ? 0.35f : 1.0f;
-            player_damage(dmg * f * k, v2norm(v2sub(W.pl.pos, pos)));
+            player_damage(dmg * f * k, v2norm(v2sub(W.pl.pos, pos)), by_player ? DS_SELF : src);
         }
     }
     /* chain reaction: shootable projectiles in the blast detonate shortly after */
@@ -413,13 +552,64 @@ void explode(V2 pos, float radius, float dmg, bool by_player, int exclude, Col c
             if (d < radius) damage_tile(y * L.w + x, dmg * (1 - maxf(0, d) / radius));
         }
     grid_impulse(pos, radius * 2.2f, radius * 3.2f);
+    hit_proj = -1;
+}
+
+/* a jettisoned cargo bomb: the more salvage went into it, the bigger the bang */
+static void cargo_blast(const Proj *pr, V2 at) {
+    float amt = (float)pr->cargo;
+    bool shrap = mod_on(MOD_SHRAPNEL);
+    float radius = (80 + sqrtf(amt) * 9) * (shrap ? 1.3f : 1.0f);
+    float dmg = 30 + amt * 0.5f;
+    W.blast_kills = 0;
+    explode(at, radius, dmg, true, -1, rgba(1, 0.62f, 0.2f, 1), DS_SELF);
+    int kills = W.blast_kills;
+    W.blast_kills = -1;
+    if (kills > G.best_bomb) G.best_bomb = kills;
+    if (kills > R.best_bomb) R.best_bomb = kills;
+    if (kills >= 3) profile_complete(CH_DEMOLITION);
+    if (kills >= 2) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d KILLS!", kills);
+        fx_popup(at, buf, C_ORANGE, 16 + kills * 2);
+    }
+    fx_explosion(at, radius * 0.3f, C_YELLOW);
+    fx_ring(at, 20, radius, rgba(1, 0.7f, 0.3f, 1), 0.5f, 8);
+    for (int i = 0; i < 30; i++)
+        fx_debris(at, v2scale(v2fromang(frand() * TAU), 150 + frand() * 380), frand() * TAU, frandr(-9, 9), 3 + frand() * 5,
+                  rgba(1, 0.7f, 0.25f, 1), 0.8f + frand() * 0.8f);
+    W.flash = maxf(W.flash, 0.35f);
+    W.flash_col = rgba(1, 0.6f, 0.2f, 1);
+    if (shrap) {
+        for (int i = 0; i < 6; i++) {
+            Proj *b = spawn_proj(PR_BLOB, at, v2scale(v2fromang(TAU * i / 6 + frand() * 0.4f), 420), 24, 2.5f);
+            if (b) { b->turn = 5.5f; b->retarget = 0.04f * i; b->col = rgba(1, 0.7f, 0.3f, 1); }
+        }
+    }
+}
+
+/* Cluster Warheads: missiles burst into small seekers */
+static void cluster_burst(const Proj *pr, V2 at) {
+    if ((pr->type != PR_CONCUSSION && pr->type != PR_HOMING) || !mod_on(MOD_CLUSTER)) return;
+    float a0 = v2ang(pr->vel);
+    for (int i = 0; i < 3; i++) {
+        V2 v = v2scale(v2fromang(a0 + PI + (i - 1) * 1.1f + frandr(-0.2f, 0.2f)), 360);
+        Proj *b = spawn_proj(PR_BLOB, at, v, 16, 2.0f);
+        if (b) { b->turn = 5.0f; b->retarget = 0.08f * i; b->col = rgba(1, 0.65f, 0.3f, 1); }
+    }
 }
 
 static void proj_detonate(Proj *pr, V2 at) {
     pr->active = false;
     bool mine = IS_ENEMY_PROJ(pr->type);
+    if (pr->type == PR_CARGO) {
+        cargo_blast(pr, at);
+        return;
+    }
     if (pr->splash > 0) {
-        explode(at, pr->splash, pr->dmg, !mine, -1, pr->col);
+        hit_proj = pr->type;
+        explode(at, pr->splash, pr->dmg, !mine, -1, pr->col, pr->src);
+        cluster_burst(pr, at);
         if (pr->type == PR_SMART) {
             for (int i = 0; i < 6; i++) {
                 V2 v = v2scale(v2fromang(TAU * i / 6 + frand() * 0.5f), 380);
@@ -440,6 +630,26 @@ static void proj_hit_fx(Proj *pr, V2 at, V2 n) {
     }
     fx_glow(at, v2(0, 0), col_a(pr->col, 0.5f), 0.18f, 12 + pr->radius);
     grid_impulse(at, 50, 60);
+}
+
+static float seg_point_dist(V2 a, V2 b, V2 p) {
+    V2 ab = v2sub(b, a);
+    float l2 = v2len2(ab);
+    float t = l2 > 1e-6f ? clampf(v2dot(v2sub(p, a), ab) / l2, 0, 1) : 0;
+    return v2dist(v2mad(a, ab, t), p);
+}
+
+/* beams and vents hurt in ticks, so a sweep across the ship is one hit, not a hundred */
+void hazard_touch(float dps, float dt, V2 dir, int src) {
+    W.hazard_acc += dps * dt;
+    W.hazard_dir = dir;
+    W.hazard_src = src;
+}
+
+bool player_hurt_by(V2 a, V2 b, float r) {
+    const Player *p = &W.pl;
+    if (p->dead || G.escaping || G.failing) return false;
+    return seg_point_dist(a, b, p->pos) < r + p->radius * 0.6f;
 }
 
 bool player_visible_to(V2 from, float dist) {
@@ -482,13 +692,6 @@ static void steer_proj(Proj *pr, V2 target, float dt) {
     pr->vel = v2scale(v2fromang(a), sp);
 }
 
-static float seg_point_dist(V2 a, V2 b, V2 p) {
-    V2 ab = v2sub(b, a);
-    float l2 = v2len2(ab);
-    float t = l2 > 1e-6f ? clampf(v2dot(v2sub(p, a), ab) / l2, 0, 1) : 0;
-    return v2dist(v2mad(a, ab, t), p);
-}
-
 static int shootable[512];
 static int nshootable;
 
@@ -497,14 +700,33 @@ static void proj_update(Proj *pr, float dt) {
     pr->life -= dt;
     bool enemy = IS_ENEMY_PROJ(pr->type);
     if (pr->life <= 0) {
-        if (pr->splash > 0 && (pr->armed || pr->type == PR_CONCUSSION || pr->type == PR_HOMING || pr->type == PR_SMART ||
-                               pr->type == PR_MEGA || pr->type == EP_MISSILE || pr->type == EP_HOMING))
+        if (pr->type == EP_FLAK || pr->type == EP_SEEKER) {
+            pr->active = false;
+            flak_pop(pr);
+        } else if (pr->type == PR_CARGO || (pr->splash > 0 && (pr->armed || pr->type == PR_CONCUSSION || pr->type == PR_HOMING || pr->type == PR_SMART ||
+                                                        pr->type == PR_MEGA || pr->type == EP_MISSILE || pr->type == EP_HOMING)))
             proj_detonate(pr, pr->pos);
         else {
             pr->active = false;
             fx_glow(pr->pos, v2(0, 0), col_a(pr->col, 0.4f), 0.2f, 10);
         }
         return;
+    }
+    /* bullet patterns: hang still, curve, speed up or slow down */
+    if (pr->wait > 0) {
+        pr->wait -= dt;
+        pr->life += dt;
+        if (pr->wait > 0) return;
+        pr->vel = pr->launch;
+    }
+    if (pr->curve != 0) {
+        pr->vel = v2rot(pr->vel, pr->curve * dt);
+        pr->curve *= expf(-1.1f * dt);
+    }
+    if (pr->accel != 0) {
+        float sp = v2len(pr->vel);
+        float ns = clampf(sp + pr->accel * dt, pr->vmin, pr->vmax);
+        if (sp > 1e-3f) pr->vel = v2scale(pr->vel, ns / sp);
     }
     /* guidance */
     switch (pr->type) {
@@ -525,7 +747,11 @@ static void proj_update(Proj *pr, float dt) {
         }
     } break;
     case EP_HOMING:
+    case EP_SEEKER:
         if (pr->age > 0.25f && player_visible_to(pr->pos, v2dist(pr->pos, W.pl.pos))) steer_proj(pr, W.pl.pos, dt);
+        break;
+    case PR_CARGO:
+        pr->vel = v2scale(pr->vel, expf(-2.0f * dt));
         break;
     case PR_PROX:
     case EP_MINE: {
@@ -565,14 +791,28 @@ static void proj_update(Proj *pr, float dt) {
     RayHit hit;
     if (raycast(old, np, &hit)) {
         if (hit.seg >= 0 && L.segs[hit.seg].tile >= 0 && !enemy) damage_tile(L.segs[hit.seg].tile, pr->dmg);
-        if (pr->type == PR_PROX || pr->type == EP_MINE) {
+        if (pr->type == PR_PROX || pr->type == EP_MINE || pr->type == PR_CARGO) {
             float vn = v2dot(pr->vel, hit.n);
             pr->vel = v2scale(v2mad(pr->vel, hit.n, -2 * vn), 0.4f);
             pr->pos = v2mad(hit.p, hit.n, 2);
             return;
         }
+        if (pr->bounces > 0 && hit.door < 0) {
+            /* ricochet coils: bounce off the rock once */
+            pr->bounces--;
+            float vn = v2dot(pr->vel, hit.n);
+            pr->vel = v2mad(pr->vel, hit.n, -2 * vn);
+            pr->pos = v2mad(hit.p, hit.n, 3);
+            pr->life = maxf(pr->life, 0.35f);
+            proj_hit_fx(pr, hit.p, hit.n);
+            return;
+        }
         V2 at = v2mad(hit.p, hit.n, 2);
-        if (pr->splash > 0) proj_detonate(pr, at);
+        if (pr->type == EP_FLAK || pr->type == EP_SEEKER) {
+            pr->pos = at;
+            pr->active = false;
+            flak_pop(pr);
+        } else if (pr->splash > 0) proj_detonate(pr, at);
         else {
             proj_hit_fx(pr, at, hit.n);
             pr->active = false;
@@ -584,6 +824,13 @@ static void proj_update(Proj *pr, float dt) {
 
     if (!enemy) {
         if (pr->type == PR_PROX && !pr->armed) return;
+        if (pr->type == PR_CARGO) {
+            /* the bomb goes off early when it bumps into a robot */
+            if (pr->age < 0.3f) return;
+            for (int i = 0; i < MAX_ROBOTS; i++)
+                if (W.rob[i].active && v2dist(W.rob[i].pos, pr->pos) < W.rob[i].radius + pr->radius) { proj_detonate(pr, pr->pos); return; }
+            return;
+        }
         for (int i = 0; i < MAX_ROBOTS; i++) {
             Robot *r = &W.rob[i];
             if (!r->active) continue;
@@ -604,7 +851,8 @@ static void proj_update(Proj *pr, float dt) {
             robot_damage(r, pr->dmg, v2norm(pr->vel), true);
             if (pr->splash > 0) {
                 pr->active = false;
-                explode(pr->pos, pr->splash, pr->dmg, true, i, pr->col);
+                explode(pr->pos, pr->splash, pr->dmg, true, i, pr->col, DS_SELF);
+                cluster_burst(pr, pr->pos);
                 if (pr->type == PR_SMART) {
                     for (int k = 0; k < 6; k++) {
                         Proj *b = spawn_proj(PR_BLOB, pr->pos, v2scale(v2fromang(TAU * k / 6), 380), 20, 2.5f);
@@ -617,11 +865,12 @@ static void proj_update(Proj *pr, float dt) {
             }
             return;
         }
-        if (W.reactor.exists && !W.reactor.dead && seg_point_dist(old, np, W.reactor.pos) < 42 + pr->radius) {
+        float rr = reactor_shielded() ? REACTOR_R + 44 : REACTOR_R - 4;
+        if (W.reactor.exists && !W.reactor.dead && seg_point_dist(old, np, W.reactor.pos) < rr + pr->radius) {
             reactor_damage(pr->dmg);
             if (pr->splash > 0) {
                 pr->active = false;
-                explode(pr->pos, pr->splash, pr->dmg * 0.5f, true, -1, pr->col);
+                explode(pr->pos, pr->splash, pr->dmg * 0.5f, true, -1, pr->col, DS_SELF);
             } else {
                 proj_hit_fx(pr, pr->pos, v2norm(v2sub(pr->pos, W.reactor.pos)));
                 if (pr->type != PR_FUSION) pr->active = false;
@@ -653,10 +902,25 @@ static void proj_update(Proj *pr, float dt) {
         Player *pl = &W.pl;
         if (pl->dead || G.escaping) return;
         if (pr->type == EP_MINE) return;
-        if (seg_point_dist(old, np, pl->pos) < pl->radius + pr->radius) {
+        /* the ship's hull is smaller than its shield glow: bullets must really hit it */
+        float d = seg_point_dist(old, np, pl->pos);
+        if (!pr->grazed && d < pl->radius + pr->radius + 22 && pr->splash <= 0) {
+            /* a graze: bullets that brush past feed the energy cells */
+            pr->grazed = true;
+            W.grazes++;
+            pl->energy = minf(200, pl->energy + 0.6f);
+            game_add_score(10);
+            fx_spark(v2lerp(pr->pos, pl->pos, 0.5f), v2scale(v2norm(v2sub(pl->pos, pr->pos)), -140), rgba(0.8f, 0.95f, 1, 1), 0.2f, 2.5f);
+            if (W.graze_snd_t <= 0) {
+                snd_play(SND_PICKUP, 0.12f, 2.2f);
+                W.graze_snd_t = 0.08f;
+            }
+        }
+        if (d < pl->radius * 0.6f + pr->radius) {
             if (pr->splash > 0) proj_detonate(pr, pr->pos);
             else {
-                player_damage(pr->dmg, v2norm(pr->vel));
+                hit_proj = pr->type;
+                player_damage(pr->dmg, v2norm(pr->vel), pr->src);
                 proj_hit_fx(pr, pr->pos, v2scale(v2norm(pr->vel), -1));
                 pr->active = false;
             }
@@ -681,8 +945,66 @@ Powerup *spawn_powerup(int type, V2 pos, V2 vel, int amount) {
     return NULL;
 }
 
+/* cargo for the hold; with the pool full of dropped weapons it goes straight in */
+static void add_cargo(int amount) {
+    if (amount > 0) W.pl.cargo += amount;
+}
+
+/* scatter exact amounts of salvage (a destroyed ship's cargo) as shards */
+static void spawn_salvage_exact(V2 pos, int amount, float speed) {
+    if (amount <= 0) return;
+    int n = clampi((amount + 3) / 4, 1, 14);
+    /* keep the powerup pool free for weapons dropped on death */
+    int used = 0;
+    for (int i = 0; i < MAX_POWERUPS; i++) used += W.pu[i].active;
+    if (used + n > MAX_POWERUPS - 64) {
+        Powerup *pu = spawn_powerup(PU_SALVAGE, pos, v2(0, 0), amount);
+        if (!pu) add_cargo(amount);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        int a = amount / n + (i < amount % n ? 1 : 0);
+        V2 v = v2scale(v2fromang(frand() * TAU), speed * (0.4f + 0.6f * frand()));
+        Powerup *pu = spawn_powerup(PU_SALVAGE, pos, v, a);
+        if (pu) pu->nopick = 0.35f + frand() * 0.2f;
+        else add_cargo(a);
+    }
+}
+
+/* salvage from wrecks: the difficulty, the sector and the scanner scale it here, once */
+void spawn_salvage(V2 pos, int amount, float speed) {
+    static float frac = 0;
+    float v = amount * run_salvage_mult() * mod_salvage_mult() + frac;
+    int got = (int)v;
+    frac = v - got;
+    spawn_salvage_exact(pos, got, speed);
+}
+
 static void select_primary(int w, bool announce);
-static void select_secondary(int s, bool announce);
+
+static bool is_special_pu(int t) { return t == PU_VULCAN || t == PU_SPREAD || t == PU_PLASMA || t == PU_FUSION; }
+static int pu_weapon(int t) { return t == PU_VULCAN ? PW_VULCAN : t == PU_SPREAD ? PW_SPREAD : t == PU_PLASMA ? PW_PLASMA : PW_FUSION; }
+static int weapon_pu(int w) { return w == PW_VULCAN ? PU_VULCAN : w == PW_SPREAD ? PU_SPREAD : w == PW_PLASMA ? PU_PLASMA : PU_FUSION; }
+static bool is_secondary_pu(int t) { return t >= PU_CONC && t <= PU_MEGA; }
+static const char *missile_word(int s, int n) { return s == SW_PROX ? (n == 1 ? "BOMB" : "BOMBS") : (n == 1 ? "MISSILE" : "MISSILES"); }
+
+/* a weapon the ship can't simply take: it would replace the one in the slot */
+static bool swap_candidate(const Powerup *pu) {
+    const Player *p = &W.pl;
+    if (is_special_pu(pu->type)) return p->special >= 0 && p->special != pu_weapon(pu->type);
+    if (is_secondary_pu(pu->type)) return p->secondary >= 0 && p->missiles > 0 && p->secondary != pu->type - PU_CONC;
+    return false;
+}
+
+static int random_module(void) {
+    int ids[MOD_COUNT], n = 0;
+    for (int i = 0; i < MOD_COUNT; i++) {
+        if (!mod_unlocked(i) || R.mods[i] >= MODS[i].max_rank) continue;
+        if (R.mods[i] == 0 && mod_installed() >= mod_slots()) continue;
+        ids[n++] = i;
+    }
+    return n ? ids[irand(n)] : -1;
+}
 
 static bool try_pickup(Powerup *pu) {
     Player *p = &W.pl;
@@ -731,46 +1053,19 @@ static bool try_pickup(Powerup *pu) {
         if (p->energy < 200) { p->energy = minf(200, p->energy + 20); hud_msg("QUAD LASERS: +ENERGY", C_YELLOW); snd_play(SND_PICKUP, 0.6f, 1.1f); return true; }
         return false;
     case PU_VULCAN:
-    case PU_VAMMO: {
-        bool had = (p->owned & (1 << PW_VULCAN)) != 0;
-        if (pu->type == PU_VAMMO && !had) {
-            if (p->vulcan_ammo >= 9999) return false;
-            p->vulcan_ammo = (p->vulcan_ammo + pu->amount) > 9999 ? 9999 : p->vulcan_ammo + pu->amount;
-            snprintf(buf, sizeof(buf), "VULCAN AMMO: %d ROUNDS", p->vulcan_ammo);
-            hud_msg(buf, rgba(1, 0.9f, 0.5f, 1));
-            snd_play(SND_PICKUP, 0.6f, 0.8f);
-            return true;
-        }
-        if (p->vulcan_ammo >= 9999 && had) {
-            if (msg_ok) hud_msg("VULCAN AMMO IS AT MAXIMUM", C_YELLOW);
-            pu->msg_cd = 3;
-            return false;
-        }
-        p->vulcan_ammo = (p->vulcan_ammo + pu->amount) > 9999 ? 9999 : p->vulcan_ammo + pu->amount;
-        if (pu->type == PU_VULCAN && !had) {
-            p->owned |= 1 << PW_VULCAN;
-            hud_msg("VULCAN CANNON!", rgba(1, 0.9f, 0.5f, 1));
-            snd_play(SND_POWERUP, 0.7f, 0.95f);
-            if (g_cfg.autoswitch && p->primary < PW_VULCAN) select_primary(PW_VULCAN, false);
-        } else {
-            snprintf(buf, sizeof(buf), "VULCAN AMMO: %d ROUNDS", p->vulcan_ammo);
-            hud_msg(buf, rgba(1, 0.9f, 0.5f, 1));
-            snd_play(SND_PICKUP, 0.6f, 0.8f);
-        }
-        return true;
-    }
     case PU_SPREAD:
     case PU_PLASMA:
     case PU_FUSION: {
-        int w = pu->type == PU_SPREAD ? PW_SPREAD : pu->type == PU_PLASMA ? PW_PLASMA : PW_FUSION;
-        if (!(p->owned & (1 << w))) {
-            p->owned |= 1 << w;
+        int w = pu_weapon(pu->type);
+        if (p->special < 0) {
+            p->special = w;
             snprintf(buf, sizeof(buf), "%s CANNON!", PRIMARY_NAMES[w]);
-            hud_msg(buf, PINFO[w == PW_SPREAD ? PR_SPREAD : w == PW_PLASMA ? PR_PLASMA : PR_FUSION].col);
+            hud_msg(buf, powerup_color(pu->type));
             snd_play(SND_POWERUP, 0.7f, 1.0f);
-            if (g_cfg.autoswitch && p->primary < w) select_primary(w, false);
+            if (g_cfg.autoswitch) select_primary(w, false);
             return true;
         }
+        if (p->special != w) return false; /* a swap, see powerups_update */
         if (p->energy < 200) {
             p->energy = minf(200, p->energy + 25);
             snprintf(buf, sizeof(buf), "%s: +ENERGY", PRIMARY_NAMES[w]);
@@ -788,7 +1083,13 @@ static bool try_pickup(Powerup *pu) {
     case PU_SMART:
     case PU_MEGA: {
         int s = pu->type - PU_CONC;
-        if (p->missiles[s] >= MAX_MISSILES[s]) {
+        if (p->secondary != s) {
+            if (p->secondary >= 0 && p->missiles > 0) return false; /* a swap */
+            p->secondary = s;
+            p->missiles = 0;
+        }
+        int cap = max_missiles(s);
+        if (p->missiles >= cap) {
             if (msg_ok) {
                 snprintf(buf, sizeof(buf), "YOU CAN'T CARRY MORE %s", s == SW_PROX ? "PROXIMITY BOMBS" : "MISSILES OF THIS TYPE");
                 hud_msg(buf, C_GREY);
@@ -796,26 +1097,19 @@ static bool try_pickup(Powerup *pu) {
             pu->msg_cd = 3;
             return false;
         }
-        int before = p->missiles[s];
         int add = pu->amount;
-        if (p->missiles[s] + add > MAX_MISSILES[s]) {
-            int left = p->missiles[s] + add - MAX_MISSILES[s];
-            add -= left;
-            pu->amount = left; /* leave the rest */
-            p->missiles[s] += add;
-            snprintf(buf, sizeof(buf), "%d %s %s!", add, SECONDARY_NAMES[s], s == SW_PROX ? "BOMBS" : "MISSILES");
-            hud_msg(buf, rgba(1, 0.7f, 0.4f, 1));
-            snd_play(SND_PICKUP, 0.6f, 1.0f);
-            return false;
+        bool rest = false;
+        if (p->missiles + add > cap) {
+            pu->amount = p->missiles + add - cap; /* leave the rest */
+            add = cap - p->missiles;
+            rest = true;
         }
-        p->missiles[s] += add;
-        if (add == 1) snprintf(buf, sizeof(buf), "%s %s!", SECONDARY_NAMES[s], s == SW_PROX ? "BOMB" : "MISSILE");
-        else snprintf(buf, sizeof(buf), "%d %s %s!", add, SECONDARY_NAMES[s], s == SW_PROX ? "BOMBS" : "MISSILES");
+        p->missiles += add;
+        if (add == 1) snprintf(buf, sizeof(buf), "%s %s!", SECONDARY_NAMES[s], missile_word(s, 1));
+        else snprintf(buf, sizeof(buf), "%d %s %s!", add, SECONDARY_NAMES[s], missile_word(s, add));
         hud_msg(buf, rgba(1, 0.7f, 0.4f, 1));
         snd_play(SND_PICKUP, 0.6f, 1.0f);
-        if (before == 0 && (p->missiles[p->secondary] == 0 || (g_cfg.autoswitch && s > p->secondary && s != SW_PROX)))
-            select_secondary(s, false);
-        return true;
+        return !rest;
     }
     case PU_CLOAK:
         p->cloak_t = 30;
@@ -832,6 +1126,58 @@ static bool try_pickup(Powerup *pu) {
         hud_msg("EXTRA LIFE!", C_GREEN);
         snd_play(SND_EXTRALIFE, 0.7f, 1.0f);
         return true;
+    case PU_SALVAGE: {
+        add_cargo(pu->amount);
+        snprintf(buf, sizeof(buf), "+%d", pu->amount);
+        fx_popup(pu->pos, buf, powerup_color(PU_SALVAGE), pu->amount >= 12 ? 13 : 10);
+        int sr = mod_rank(MOD_SIPHON);
+        if (sr > 0) {
+            p->energy = minf(200, p->energy + 0.6f * pu->amount);
+            if (sr >= 2) p->shield = minf(200, p->shield + 0.25f * pu->amount);
+        }
+        if (p->salvage_snd_t <= 0) {
+            snd_play(SND_PICKUP, 0.3f, frandr(1.5f, 1.7f));
+            p->salvage_snd_t = 0.06f;
+        }
+        if (!W.cargo_hint && p->cargo >= 25 && g_prof.runs < 3) {
+            W.cargo_hint = true;
+            hud_hint("SALVAGE IS CARGO: IT MAKES YOU HEAVIER UNTIL YOU BANK IT AT THE EXIT.  F DUMPS HALF AS A BOMB");
+        }
+        return true;
+    }
+    case PU_TREASURE:
+        add_cargo(pu->amount);
+        snprintf(buf, sizeof(buf), "VAULT TREASURE: +%d SALVAGE", pu->amount);
+        hud_msg(buf, powerup_color(PU_SALVAGE));
+        snprintf(buf, sizeof(buf), "+%d", pu->amount);
+        fx_popup(pu->pos, buf, C_YELLOW, 20);
+        fx_ring(pu->pos, 10, 160, powerup_color(PU_SALVAGE), 0.6f, 8);
+        W.flash = 0.4f;
+        W.flash_col = powerup_color(PU_SALVAGE);
+        snd_play(SND_EXTRALIFE, 0.6f, 1.4f);
+        profile_complete(CH_VAULT);
+        return true;
+    case PU_CRATE: {
+        int m = random_module();
+        if (m >= 0) {
+            mod_add(m);
+            snprintf(buf, sizeof(buf), "R&D CRATE: %s %s", MODS[m].name, R.mods[m] > 1 ? "UPGRADED" : "INSTALLED");
+            hud_msg(buf, mod_color(MODS[m].cat));
+            snprintf(buf, sizeof(buf), "%s", MODS[m].desc);
+            for (char *c = buf; *c; c++) if (*c == '\n') *c = ' ';
+            hud_hint(buf);
+            if (m == MOD_QUAD) p->quad = true;
+            if (m == MOD_CALIBRATE) p->laser_level = clampi(p->laser_level, mod_base_laser(), 4);
+        } else {
+            add_cargo(80);
+            hud_msg("R&D CRATE: NOTHING FITS - 80 SALVAGE INSTEAD", powerup_color(PU_SALVAGE));
+        }
+        fx_ring(pu->pos, 10, 180, C_MAGENTA, 0.6f, 8);
+        W.flash = 0.4f;
+        W.flash_col = C_MAGENTA;
+        snd_play(SND_EXTRALIFE, 0.7f, 1.1f);
+        return true;
+    }
     case PU_KEY_BLUE:
     case PU_KEY_YELLOW:
     case PU_KEY_RED: {
@@ -849,8 +1195,43 @@ static bool try_pickup(Powerup *pu) {
     return false;
 }
 
+/* take the weapon under the ship and leave the one from the slot in its place */
+static void swap_weapon(void) {
+    Player *p = &W.pl;
+    if (p->swap_pu < 0) return;
+    Powerup *pu = &W.pu[p->swap_pu];
+    if (!pu->active || !swap_candidate(pu)) return;
+    char buf[96];
+    V2 at = pu->pos;
+    if (is_special_pu(pu->type)) {
+        int old = p->special;
+        p->special = pu_weapon(pu->type);
+        pu->type = weapon_pu(old);
+        pu->amount = 1;
+        if (p->primary == old) p->primary = p->special;
+        snprintf(buf, sizeof(buf), "%s CANNON SWAPPED IN", PRIMARY_NAMES[p->special]);
+    } else {
+        int old = p->secondary, oldn = p->missiles;
+        int s = pu->type - PU_CONC;
+        int cap = max_missiles(s);
+        p->secondary = s;
+        p->missiles = pu->amount < cap ? pu->amount : cap;
+        pu->type = PU_CONC + old;
+        pu->amount = oldn;
+        snprintf(buf, sizeof(buf), "%d %s %s SWAPPED IN", p->missiles, SECONDARY_NAMES[s], missile_word(s, p->missiles));
+    }
+    pu->nopick = 1.0f;
+    pu->msg_cd = 1.0f;
+    pu->vel = v2scale(v2fromang(frand() * TAU), 60);
+    hud_msg(buf, rgba(0.7f, 0.9f, 1, 1));
+    snd_play(SND_POWERUP, 0.6f, 1.2f);
+    fx_ring(at, 6, 50, powerup_color(pu->type), 0.3f, 4);
+    p->swap_pu = -1;
+}
+
 static void powerups_update(float dt) {
     Player *p = &W.pl;
+    p->swap_pu = -1;
     for (int i = 0; i < MAX_POWERUPS; i++) {
         Powerup *pu = &W.pu[i];
         if (!pu->active) continue;
@@ -859,10 +1240,15 @@ static void powerups_update(float dt) {
         pu->msg_cd -= dt;
         if (!p->dead && !G.escaping && pu->nopick <= 0) {
             float d = v2dist(pu->pos, p->pos);
-            if (d < 80 && d > 1 && pu->msg_cd <= 0)
+            bool swap = swap_candidate(pu);
+            if (pu->type == PU_SALVAGE || pu->type == PU_TREASURE) {
+                if (d < mod_salvage_magnet() && d > 1) pu->vel = v2mad(pu->vel, v2scale(v2sub(p->pos, pu->pos), 1.0f / d), 1400 * dt);
+            } else if (d < mod_magnet() && d > 1 && pu->msg_cd <= 0 && !swap)
                 pu->vel = v2mad(pu->vel, v2scale(v2sub(p->pos, pu->pos), 1.0f / d), 500 * dt);
             if (d < p->radius + 15) {
-                if (try_pickup(pu)) {
+                if (swap) {
+                    p->swap_pu = i;
+                } else if (try_pickup(pu)) {
                     pu->active = false;
                     fx_ring(pu->pos, 6, 40, powerup_color(pu->type), 0.3f, 4);
                     fx_burst(pu->pos, 10, powerup_color(pu->type), 160, 0.35f, 3);
@@ -876,6 +1262,11 @@ static void powerups_update(float dt) {
             circle_collide(&pu->pos, 12, &pu->vel, 0.5f);
         }
     }
+    if (p->swap_pu >= 0 && !W.swap_hint) {
+        W.swap_hint = true;
+        hud_hint(g_in.use_stick ? "RB SWAPS THE WEAPON IN YOUR SLOT FOR THIS ONE" : "E SWAPS THE WEAPON IN YOUR SLOT FOR THIS ONE");
+    }
+    if (g_in.swap) swap_weapon();
 }
 
 static void hostages_update(float dt) {
@@ -902,7 +1293,8 @@ static void hostages_update(float dt) {
 static bool can_open(const Door *d) {
     switch (d->lock) {
     case LOCK_NONE: return true;
-    case LOCK_EXIT: return G.reactor_dead;
+    case LOCK_EXIT:
+    case LOCK_VAULT: return G.reactor_dead;
     default: return (W.pl.keys & lock_bit(d->lock)) != 0;
     }
 }
@@ -924,6 +1316,7 @@ static void doors_update(float dt) {
                     case LOCK_YELLOW: m = "YELLOW ACCESS KEY REQUIRED"; break;
                     case LOCK_RED: m = "RED ACCESS KEY REQUIRED"; break;
                     case LOCK_EXIT: m = G.boss_level ? "EXIT SEALED - DESTROY THE OVERSEER" : "EXIT SEALED - DESTROY THE REACTOR CORE"; break;
+                    case LOCK_VAULT: m = "VAULT SEALED - IT OPENS WHEN THE REACTOR BLOWS"; break;
                     }
                     hud_msg(m, key_color(d->lock));
                     snd_play(SND_LOCKED, 0.6f, 1.0f);
@@ -962,14 +1355,6 @@ static void doors_update(float dt) {
 /* ------------------------------------------------------------ player */
 static V2 ship_local(V2 local) { return safe_muzzle(W.pl.pos, v2add(W.pl.pos, v2rot(local, W.pl.ang))); }
 
-static bool can_use_primary(int w) {
-    Player *p = &W.pl;
-    if (!(p->owned & (1 << w))) return false;
-    if (w == PW_VULCAN) return p->vulcan_ammo > 0;
-    if (w == PW_LASER) return true;
-    return p->energy >= 1.0f;
-}
-
 static void stop_charge(void) {
     Player *p = &W.pl;
     if (p->charge_voice) snd_stop(p->charge_voice);
@@ -978,19 +1363,15 @@ static void stop_charge(void) {
     p->fusion_charge = 0;
 }
 
+/* two primary slots: the laser, and one special weapon */
 static void select_primary(int w, bool announce) {
     Player *p = &W.pl;
     char buf[64];
-    if (!(p->owned & (1 << w))) {
+    if (w != PW_LASER && w != p->special) {
         if (announce) {
-            snprintf(buf, sizeof(buf), "YOU DON'T HAVE THE %s CANNON", PRIMARY_NAMES[w]);
-            hud_msg(buf, C_GREY);
+            hud_msg("NO SPECIAL WEAPON IN YOUR SECOND SLOT", C_GREY);
             snd_play(SND_NOAMMO, 0.5f, 1.0f);
         }
-        return;
-    }
-    if (w == PW_VULCAN && p->vulcan_ammo <= 0) {
-        if (announce) { hud_msg("NO VULCAN AMMO", C_GREY); snd_play(SND_NOAMMO, 0.5f, 1.0f); }
         return;
     }
     if (p->primary == w) return;
@@ -1002,72 +1383,119 @@ static void select_primary(int w, bool announce) {
     p->fire_cd = maxf(p->fire_cd, 0.15f);
 }
 
-static void cycle_primary(int dir) {
-    Player *p = &W.pl;
-    for (int k = 1; k <= PW_COUNT; k++) {
-        int w = ((p->primary + dir * k) % PW_COUNT + PW_COUNT) % PW_COUNT;
-        if (can_use_primary(w)) { select_primary(w, true); return; }
-    }
-}
-
 static void fallback_primary(void) {
-    Player *p = &W.pl;
-    for (int w = PW_FUSION; w >= PW_LASER; w--) {
-        if (w != p->primary && can_use_primary(w)) {
-            select_primary(w, false);
-            return;
-        }
-    }
-}
-
-static void select_secondary(int s, bool announce) {
-    Player *p = &W.pl;
-    char buf[64];
-    if (p->missiles[s] <= 0) {
-        if (announce) {
-            snprintf(buf, sizeof(buf), "NO %s %s", SECONDARY_NAMES[s], s == SW_PROX ? "BOMBS" : "MISSILES");
-            hud_msg(buf, C_GREY);
-            snd_play(SND_NOAMMO, 0.5f, 1.0f);
-        }
-        return;
-    }
-    if (p->secondary == s) return;
-    p->secondary = s;
-    snprintf(buf, sizeof(buf), "%s %s SELECTED", SECONDARY_NAMES[s], s == SW_PROX ? "BOMBS" : "MISSILES");
-    hud_msg(buf, rgba(1, 0.75f, 0.5f, 1));
-    snd_play(SND_MENU_MOVE, 0.5f, 0.7f);
-}
-
-static void cycle_secondary(int dir) {
-    Player *p = &W.pl;
-    for (int k = 1; k <= SW_COUNT; k++) {
-        int s = ((p->secondary + dir * k) % SW_COUNT + SW_COUNT) % SW_COUNT;
-        if (p->missiles[s] > 0) { select_secondary(s, true); return; }
-    }
-    hud_msg("NO SECONDARY WEAPONS", C_GREY);
+    if (W.pl.primary != PW_LASER) select_primary(PW_LASER, false);
 }
 
 static void player_die(void);
 
-void player_damage(float dmg, V2 dir) {
+/* a shock pulse around the ship: damages robots and erases enemy shots */
+static void ship_pulse(float radius, float dmg, Col c) {
     Player *p = &W.pl;
+    for (int i = 0; i < MAX_ROBOTS; i++) {
+        Robot *r = &W.rob[i];
+        if (!r->active) continue;
+        float d = v2dist(r->pos, p->pos) - r->radius;
+        if (d > radius || !los(p->pos, r->pos)) continue;
+        robot_damage(r, dmg * (1 - maxf(0, d) / radius * 0.5f), v2norm(v2sub(r->pos, p->pos)), true);
+    }
+    for (int i = 0; i < MAX_PROJ; i++) {
+        Proj *e = &W.proj[i];
+        if (!e->active || !IS_ENEMY_PROJ(e->type) || e->type == EP_MINE) continue;
+        if (v2dist(e->pos, p->pos) > radius) continue;
+        e->active = false;
+        fx_burst(e->pos, 5, e->col, 150, 0.25f, 3);
+    }
+    fx_ring(p->pos, 20, radius, c, 0.35f, 7);
+    fx_ring(p->pos, 10, radius * 0.6f, col_white(c, 0.5f), 0.25f, 4);
+    grid_impulse(p->pos, radius * 1.6f, radius * 3);
+    snd_play(SND_PROX, 0.5f, 0.7f);
+}
+
+/* the Phoenix Protocol turns one lethal hit per mine into a narrow escape */
+static bool try_phoenix(void) {
+    Player *p = &W.pl;
+    if (!mod_on(MOD_PHOENIX) || W.phoenix_used) return false;
+    W.phoenix_used = true;
+    p->shield = 30;
+    p->invuln_t = 3;
+    ship_pulse(220, 60, rgba(1, 0.6f, 0.2f, 1));
+    fx_explosion(p->pos, 40, rgba(1, 0.7f, 0.3f, 1));
+    W.flash = 0.5f;
+    W.flash_col = rgba(1, 0.6f, 0.2f, 1);
+    W.time_scale = 0.35f;
+    shake_add(0.6f);
+    snd_play(SND_EXTRALIFE, 0.7f, 0.8f);
+    hud_msg("PHOENIX PROTOCOL ENGAGED!", rgba(1, 0.65f, 0.25f, 1));
+    return true;
+}
+
+/* the gravity anchor: a heavier ship shrugs off more */
+static float anchor_factor(void) { return mod_on(MOD_ANCHOR) ? 1.0f - clampf((W.pl.mass - 1) * 0.4f, 0, 0.4f) : 1.0f; }
+
+void player_damage(float dmg, V2 dir, int src) {
+    Player *p = &W.pl;
+    int proj = hit_proj;
+    hit_proj = -1;
     if (p->dead || G.escaping || G.failing || dmg <= 0) return;
-    if (p->invuln_t > 0 || p->spawn_inv > 0) {
-        fx_ring(p->pos, 18, 30, C_YELLOW, 0.2f, 4);
+    if (p->invuln_t > 0 || p->spawn_inv > 0 || p->phase_t > 0) {
+        fx_ring(p->pos, 18, 30, p->phase_t > 0 ? C_CYAN : C_YELLOW, 0.2f, 4);
         return;
     }
-    dmg *= DIFF_DMG[G.difficulty];
+    dmg *= DIFF_DMG[G.difficulty] * mod_damage_taken() * anchor_factor();
+    W.last_src = src;
+    W.last_proj = proj;
+    if (mod_on(MOD_SCRAP) && p->cargo > 1) {
+        /* scrap armour: half the hit is paid in salvage from the hold */
+        float pay = minf(dmg * 0.5f, p->cargo * 0.5f);
+        p->cargo -= (int)ceilf(pay * 2);
+        if (p->cargo < 0) p->cargo = 0;
+        dmg -= pay;
+        for (int i = 0; i < 6; i++) fx_spark(p->pos, v2scale(v2fromang(frand() * TAU), 120 + frand() * 160), powerup_color(PU_SALVAGE), 0.35f, 3);
+    }
     p->shield -= dmg;
+    p->calm_t = 0;
+    if (mod_on(MOD_REACTIVE) && p->reactive_cd <= 0) {
+        p->reactive_cd = 2.5f;
+        ship_pulse(150, 30, rgba(0.4f, 0.75f, 1, 1));
+    }
     p->hit_flash = 0.35f;
     if (v2len2(dir) > 0.01f) { p->hit_dir = v2scale(v2norm(dir), -1); p->hit_dir_t = 0.7f; }
     shake_add(clampf(0.12f + dmg * 0.025f, 0, 0.6f));
-    p->vel = v2mad(p->vel, dir, clampf(dmg * 9, 30, 260));
+    p->vel = v2mad(p->vel, dir, clampf(dmg * 9, 30, 260) / p->mass);
     snd_play(SND_PLAYER_HIT, clampf(0.4f + dmg * 0.03f, 0.4f, 0.9f), frandr(0.9f, 1.1f));
     W.flash = maxf(W.flash, clampf(dmg * 0.02f, 0.05f, 0.3f));
     W.flash_col = rgba(1, 0.2f, 0.15f, 1);
     for (int i = 0; i < 8; i++)
         fx_spark(p->pos, v2scale(v2fromang(frand() * TAU), 100 + frand() * 200), rgba(0.5f, 0.8f, 1, 1), 0.3f, 3);
-    if (p->shield < 0) player_die();
+    if (p->shield < 0 && !try_phoenix()) player_die();
+}
+
+const char *game_killer_text(void) {
+    static char buf[64];
+    int s = W.last_src, pr = W.last_proj;
+    const char *who = s >= 0 && s < RB_COUNT ? RDEF[s].name : s == DS_REACTOR ? "THE REACTOR CORE" : s == DS_SELF ? "YOUR OWN BLAST"
+                      : s == DS_OVERCHARGE ? "FUSION OVERCHARGE" : s == DS_BLAST ? "THE SELF-DESTRUCT" : s == DS_TRAP ? "A MINE TRAP" : "THE MINE";
+    const char *how = NULL;
+    switch (pr) {
+    case EP_PULSE: how = "PULSE SHOT"; break;
+    case EP_BOLT: how = "LASER BOLT"; break;
+    case EP_NEEDLE: how = "NEEDLES"; break;
+    case EP_VULCAN: how = "VULCAN FIRE"; break;
+    case EP_MISSILE: how = "MISSILE"; break;
+    case EP_HOMING: how = "HOMING MISSILE"; break;
+    case EP_MINE: how = "PROXIMITY MINE"; break;
+    case EP_ORB: how = "PLASMA ORB"; break;
+    case EP_REACTOR: how = NULL; break;
+    case EP_PELLET: how = "PLASMA PELLETS"; break;
+    case EP_SHARD: how = "SHARDS"; break;
+    case EP_FLAK: how = "FLAK"; break;
+    case EP_SEEKER: how = "SEEKER MINE"; break;
+    default: if (s >= 0 && s < RB_COUNT && RDEF[s].contact > 0) how = "CLAWS"; break;
+    }
+    if (how) snprintf(buf, sizeof(buf), "%s - %s", who, how);
+    else snprintf(buf, sizeof(buf), "%s", who);
+    return buf;
 }
 
 static void drop_scatter(int type, int amount) {
@@ -1090,17 +1518,21 @@ static void player_die(void) {
     W.flash = 0.6f;
     W.flash_col = rgba(1, 1, 1, 1);
     grid_impulse(p->pos, 360, 700);
-    /* Descent-style: everything you carried is left where you died */
-    if (p->owned & (1 << PW_SPREAD)) drop_scatter(PU_SPREAD, 1);
-    if (p->owned & (1 << PW_PLASMA)) drop_scatter(PU_PLASMA, 1);
-    if (p->owned & (1 << PW_FUSION)) drop_scatter(PU_FUSION, 1);
-    if (p->owned & (1 << PW_VULCAN)) drop_scatter(PU_VULCAN, p->vulcan_ammo > 200 ? p->vulcan_ammo : 200);
-    else if (p->vulcan_ammo > 0) drop_scatter(PU_VAMMO, p->vulcan_ammo);
-    for (int i = 1; i < p->laser_level; i++) drop_scatter(PU_LASER, 1);
-    if (p->quad) drop_scatter(PU_QUAD, 1);
-    for (int s = 0; s < SW_COUNT; s++)
-        if (p->missiles[s] > 0) drop_scatter(PU_CONC + s, p->missiles[s]);
+    R.deaths++;
+    /* everything you carried is left where you died, the cargo too */
+    if (p->special >= 0) drop_scatter(weapon_pu(p->special), 1);
+    /* levels the modules provide come back with the next ship anyway */
+    for (int i = mod_base_laser(); i < p->laser_level; i++) drop_scatter(PU_LASER, 1);
+    if (p->quad && !mod_on(MOD_QUAD)) drop_scatter(PU_QUAD, 1);
+    if (p->secondary >= 0 && p->missiles > 0) drop_scatter(PU_CONC + p->secondary, p->missiles);
     drop_scatter(PU_ENERGY, 1);
+    if (p->cargo > 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d CARGO SPILLED - FLY BACK FOR IT", p->cargo);
+        hud_msg(buf, powerup_color(PU_SALVAGE));
+        spawn_salvage_exact(p->pos, p->cargo, 260);
+        p->cargo = 0;
+    }
     if (G.hostages_onboard > 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "%d HOSTAGE%s LOST!", G.hostages_onboard, G.hostages_onboard > 1 ? "S" : "");
@@ -1112,6 +1544,7 @@ static void player_die(void) {
     G.chain_t = 0;
     W.time_scale = 0.25f;
     hud_msg("SHIP DESTROYED", C_RED);
+    if (G.lives <= 0) snprintf(R.killed_by, sizeof(R.killed_by), "%s", game_killer_text());
 }
 
 static void player_respawn(void) {
@@ -1124,11 +1557,30 @@ static void player_respawn(void) {
     p->spawn_inv = 3.0f;
     p->hit_flash = 0;
     p->cloak_t = p->invuln_t = 0;
+    reset_modules();
     g_cam.pos = p->pos;
+    g_cam.lean = v2(0, 0);
     snd_play(SND_TELEPORT, 0.6f, 1.0f);
     fx_ring(p->pos, 10, 120, rgba(0.6f, 0.9f, 1, 1), 0.7f, 6);
     hud_msg("NEW SHIP DEPLOYED", rgba(0.6f, 0.9f, 1, 1));
     flow_compute(L.flow, tx_of(p->pos.x), tx_of(p->pos.y), false);
+}
+
+/* everything that scales the primary weapons right now */
+static float primary_dmg(void) {
+    const Player *p = &W.pl;
+    float k = mod_primary_dmg();
+    int mr = mod_rank(MOD_MOMENTUM);
+    if (mr) k *= 1.0f + 0.25f * mr * clampf(v2len(p->vel) / 520.0f, 0, 1);
+    if (mod_on(MOD_OVERDRIVE) && G.reactor_dead) k *= 1.35f;
+    if (mod_on(MOD_LIFESUPPORT)) k *= 1.0f + 0.06f * G.hostages_onboard;
+    return k;
+}
+
+static Proj *spawn_primary(int type, V2 pos, V2 vel, float dmg, float life) {
+    Proj *pr = spawn_proj(type, pos, vel, dmg, life);
+    if (pr && mod_on(MOD_RICOCHET)) pr->bounces = 1;
+    return pr;
 }
 
 static void fire_primary(float dt) {
@@ -1154,20 +1606,28 @@ static void fire_primary(float dt) {
             p->energy = maxf(0, p->energy - 7 * dt);
             if (p->fusion_charge > 2.4f) {
                 p->over_t += dt;
-                if (p->invuln_t <= 0 && p->spawn_inv <= 0) p->shield -= 9 * dt * DIFF_DMG[G.difficulty];
+                if (p->invuln_t <= 0 && p->spawn_inv <= 0) {
+                    p->shield -= 9 * dt * DIFF_DMG[G.difficulty] * mod_damage_taken();
+                    W.last_src = DS_OVERCHARGE;
+                    W.last_proj = -1;
+                }
                 shake_add(0.03f);
                 p->hit_flash = maxf(p->hit_flash, 0.1f);
                 if (p->warn_cd <= 0) { hud_msg("FUSION OVERCHARGE! RELEASE!", C_RED); p->warn_cd = 1.5f; }
-                if (p->shield < 0) { player_die(); return; }
+                if (p->shield < 0) {
+                    if (try_phoenix()) stop_charge();
+                    else player_die();
+                    return;
+                }
             }
             if (!held) {
                 float k = clampf(p->fusion_charge / 1.6f, 0, 1);
-                Proj *pr = spawn_proj(PR_FUSION, ship_local(v2(20, 0)), v2add(v2scale(dir, 1150), v2scale(p->vel, 0.3f)), 40 + 140 * k, 1.4f);
+                Proj *pr = spawn_proj(PR_FUSION, ship_local(v2(20, 0)), v2add(v2scale(dir, 1150), v2scale(p->vel, 0.3f)), (40 + 140 * k) * primary_dmg(), 1.4f);
                 if (pr) { pr->charge = k; pr->radius = 10 + 8 * k; }
                 snd_play(SND_FUSION, 0.6f + 0.35f * k, 1.15f - 0.25f * k);
                 stop_charge();
                 p->fire_cd = 0.45f;
-                p->vel = v2mad(p->vel, dir, -(60 + 140 * k));
+                p->vel = v2mad(p->vel, dir, -(60 + 140 * k) / p->mass);
                 shake_add(0.1f + 0.2f * k);
                 p->muzzle_flash = 1;
                 grid_impulse(ship_local(v2(20, 0)), 120, 200 + 300 * k);
@@ -1177,18 +1637,19 @@ static void fire_primary(float dt) {
     }
     if (!held || p->fire_cd > 0) return;
     V2 base = v2add(v2scale(dir, 1000), v2scale(p->vel, 0.35f));
+    float pd = primary_dmg();
     switch (p->primary) {
     case PW_LASER: {
         float cost = p->quad ? 0.7f : 0.5f;
         bool low = p->energy < cost;
         p->energy = maxf(0, p->energy - cost);
-        float dmg = LASER_DMG[p->laser_level];
+        float dmg = LASER_DMG[p->laser_level] * pd;
         Col c = LASER_COL[p->laser_level];
         V2 mz[4] = {v2(7, 11.5f), v2(7, -11.5f), v2(13, 5), v2(13, -5)};
         int n = p->quad ? 4 : 2;
         for (int i = 0; i < n; i++) {
             /* the inner quad bolts are lighter */
-            Proj *pr = spawn_proj(PR_LASER, ship_local(mz[i]), base, i < 2 ? dmg : dmg * 0.6f, 0.8f);
+            Proj *pr = spawn_primary(PR_LASER, ship_local(mz[i]), base, i < 2 ? dmg : dmg * 0.6f, 0.8f);
             if (pr) pr->col = c;
         }
         snd_play(p->laser_level >= 3 ? SND_LASER2 : SND_LASER, 0.32f, frandr(0.95f, 1.05f) * (p->quad ? 0.92f : 1.0f));
@@ -1196,24 +1657,23 @@ static void fire_primary(float dt) {
         if (low && p->warn_cd <= 0) { hud_msg("ENERGY DEPLETED - LASERS AT MINIMUM POWER", C_YELLOW); p->warn_cd = 4; }
     } break;
     case PW_VULCAN: {
-        if (p->vulcan_ammo <= 0) { hud_msg("OUT OF VULCAN AMMO", C_GREY); fallback_primary(); return; }
-        p->vulcan_ammo--;
+        if (p->energy < 0.25f) { hud_msg("OUT OF ENERGY!", C_YELLOW); fallback_primary(); return; }
+        p->energy -= 0.25f;
         float a = p->ang + frandr(-0.035f, 0.035f);
         V2 v = v2add(v2scale(v2fromang(a), 1500), v2scale(p->vel, 0.3f));
-        spawn_proj(PR_VULCAN, ship_local(p->fire_side ? v2(7, 11.5f) : v2(7, -11.5f)), v, 5.5f, 0.55f);
+        spawn_primary(PR_VULCAN, ship_local(p->fire_side ? v2(7, 11.5f) : v2(7, -11.5f)), v, 5.5f * pd, 0.55f);
         p->fire_side ^= 1;
         snd_play(SND_VULCAN, 0.28f, frandr(0.9f, 1.1f));
         p->fire_cd = 0.065f;
-        p->vel = v2mad(p->vel, dir, -6);
+        p->vel = v2mad(p->vel, dir, -6 / p->mass);
         shake_add(0.008f);
-        if (p->vulcan_ammo == 0) { hud_msg("OUT OF VULCAN AMMO", C_GREY); fallback_primary(); }
     } break;
     case PW_SPREAD: {
         if (p->energy < 0.75f) { hud_msg("OUT OF ENERGY!", C_YELLOW); fallback_primary(); return; }
         p->energy -= 0.75f;
         for (int i = -1; i <= 1; i++) {
             V2 v = v2add(v2scale(v2fromang(p->ang + i * 0.13f), 850), v2scale(p->vel, 0.3f));
-            spawn_proj(PR_SPREAD, ship_local(v2(16, 0)), v, 12, 0.9f);
+            spawn_primary(PR_SPREAD, ship_local(v2(16, 0)), v, 12 * pd, 0.9f);
         }
         snd_play(SND_SPREAD, 0.3f, frandr(0.95f, 1.05f));
         p->fire_cd = 0.18f;
@@ -1222,7 +1682,7 @@ static void fire_primary(float dt) {
         if (p->energy < 0.6f) { hud_msg("OUT OF ENERGY!", C_YELLOW); fallback_primary(); return; }
         p->energy -= 0.6f;
         V2 v = v2add(v2scale(dir, 1100), v2scale(p->vel, 0.3f));
-        spawn_proj(PR_PLASMA, ship_local(p->fire_side ? v2(8, 11) : v2(8, -11)), v, 15, 0.8f);
+        spawn_primary(PR_PLASMA, ship_local(p->fire_side ? v2(8, 11) : v2(8, -11)), v, 15 * pd, 0.8f);
         p->fire_side ^= 1;
         snd_play(SND_PLASMA, 0.28f, frandr(0.95f, 1.08f));
         p->fire_cd = 0.09f;
@@ -1231,30 +1691,21 @@ static void fire_primary(float dt) {
     p->muzzle_flash = 1;
 }
 
+/* one secondary slot; proximity bombs are dropped behind the ship */
 static void fire_secondary(void) {
     Player *p = &W.pl;
     V2 dir = v2fromang(p->ang);
-    if (g_in.drop_bomb && p->sec_cd <= 0) {
-        if (p->missiles[SW_PROX] > 0) {
-            p->missiles[SW_PROX]--;
-            spawn_proj(PR_PROX, ship_local(v2(-18, 0)), v2add(v2scale(p->vel, 0.3f), v2scale(dir, -80)), 70, 25);
-            snd_play(SND_PROX, 0.5f, 1.0f);
-            p->sec_cd = 0.4f;
-        } else {
-            hud_msg("NO PROXIMITY BOMBS", C_GREY);
-            snd_play(SND_NOAMMO, 0.4f, 1.0f);
-            p->sec_cd = 0.4f;
-        }
-        return;
-    }
     if (!g_in.fire2 || p->sec_cd > 0) return;
     int s = p->secondary;
-    if (p->missiles[s] <= 0) {
-        cycle_secondary(1);
-        s = p->secondary;
-        if (p->missiles[s] <= 0) { snd_play(SND_NOAMMO, 0.4f, 1.0f); p->sec_cd = 0.5f; return; }
+    if (s < 0 || p->missiles <= 0) {
+        if (g_in.fire2_pressed) {
+            hud_msg("NO MISSILES", C_GREY);
+            snd_play(SND_NOAMMO, 0.4f, 1.0f);
+        }
+        p->sec_cd = 0.5f;
+        return;
     }
-    p->missiles[s]--;
+    p->missiles--;
     V2 side = p->sec_side ? v2(4, 9) : v2(4, -9);
     p->sec_side ^= 1;
     V2 mz = ship_local(side);
@@ -1286,17 +1737,145 @@ static void fire_secondary(void) {
         pr = spawn_proj(PR_MEGA, ship_local(v2(14, 0)), v2add(v2scale(dir, 300), inherit), 170, 5);
         if (pr) pr->turn = 1.1f;
         p->sec_cd = 1.2f;
-        p->vel = v2mad(p->vel, dir, -140);
+        p->vel = v2mad(p->vel, dir, -140 / p->mass);
         snd_play(SND_MEGA, 0.7f, 1.0f);
         shake_add(0.15f);
         break;
     }
-    if (p->missiles[s] == 0) {
-        for (int k = 1; k <= SW_COUNT; k++) {
-            int n = (s + k) % SW_COUNT;
-            if (p->missiles[n] > 0 && n != SW_PROX) { select_secondary(n, false); break; }
+    if (p->missiles == 0) hud_msg("SECONDARY SLOT EMPTY", C_GREY);
+}
+
+/* dump half the hold as a bomb: a lighter ship and a bang that grows with the salvage */
+static void jettison_cargo(void) {
+    Player *p = &W.pl;
+    if (p->jettison_cd > 0) return;
+    if (p->cargo < 10) {
+        hud_msg(p->cargo > 0 ? "NOT ENOUGH CARGO FOR A BOMB" : "THE HOLD IS EMPTY", C_GREY);
+        snd_play(SND_NOAMMO, 0.4f, 1.0f);
+        p->jettison_cd = 0.4f;
+        return;
+    }
+    int amount = p->cargo < 20 ? p->cargo : p->cargo / 2;
+    p->cargo -= amount;
+    V2 dir = v2fromang(p->ang);
+    Proj *pr = spawn_proj(PR_CARGO, ship_local(v2(-18, 0)), v2add(v2scale(p->vel, 0.3f), v2scale(dir, -90)), 0, 1.1f);
+    if (pr) {
+        pr->cargo = amount;
+        pr->radius = 9 + minf(10, sqrtf((float)amount) * 0.5f);
+    }
+    p->vel = v2mad(p->vel, dir, 60);
+    p->jettison_cd = 0.6f;
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%d CARGO JETTISONED!", amount);
+    hud_msg(buf, powerup_color(PU_SALVAGE));
+    snd_play(SND_PROX, 0.7f, 0.6f);
+    fx_ring(p->pos, 10, 60, powerup_color(PU_SALVAGE), 0.3f, 5);
+}
+
+/* Ram Prow: the afterburning ship smashes robots it touches, harder the heavier it is */
+static void ram_robots(void) {
+    Player *p = &W.pl;
+    float sp = v2len(p->vel);
+    for (int i = 0; i < MAX_ROBOTS; i++) {
+        Robot *r = &W.rob[i];
+        if (!r->active || W.time < r->ram_next) continue;
+        if (r->type == RB_BOSS && r->invis_t > 0) continue;
+        V2 to = v2sub(r->pos, p->pos);
+        if (v2len(to) > r->radius + p->radius + 4) continue;
+        V2 dir = v2norm(to);
+        r->ram_next = W.time + 0.35f;
+        V2 at = v2mad(p->pos, dir, p->radius);
+        W.ramming = true;
+        robot_damage(r, (45 + sp * 0.06f) * p->mass, dir, true);
+        W.ramming = false;
+        p->vel = v2scale(p->vel, 0.8f + 0.1f * clampf(p->mass - 1, 0, 1));
+        fx_burst(at, 14, rgba(0.6f, 1, 0.85f, 1), 260, 0.35f, 3);
+        fx_ring(at, 6, 40 + 12 * p->mass, rgba(0.6f, 1, 0.85f, 1), 0.2f, 4);
+        grid_impulse(at, 90, 160 * p->mass);
+        shake_add(0.12f + 0.06f * p->mass);
+        snd_play_at(SND_EXPL_S, at, 0.6f, 1.5f - 0.2f * p->mass);
+    }
+}
+
+/* on-kill modules, challenges and stats; returns the salvage multiplier for the wreck */
+float player_on_kill(Robot *r) {
+    Player *p = &W.pl;
+    R.kills++;
+    g_prof.lifetime_kills++;
+    if (W.blast_kills >= 0) W.blast_kills++;
+    if (W.ramming) {
+        G.ram_kills++;
+        if (G.ram_kills >= 5) profile_complete(CH_RAM);
+    }
+    int vr = mod_rank(MOD_VAMPIRE);
+    if (vr && !p->dead) p->shield = minf(200, p->shield + 2.0f * vr);
+    int fr = mod_rank(MOD_FABRICATOR);
+    if (fr && !p->dead && ++p->fab_kills >= (fr >= 2 ? 5 : 8)) {
+        p->fab_kills = 0;
+        int s = p->secondary >= 0 ? p->secondary : SW_CONCUSSION;
+        if (p->secondary < 0) { p->secondary = s; p->missiles = 0; }
+        if (p->missiles < max_missiles(s)) {
+            p->missiles++;
+            fx_popup(p->pos, "+1 MISSILE", rgba(1, 0.7f, 0.4f, 1), 11);
         }
     }
+    if (mod_on(MOD_DETONATOR) && r->type != RB_BOSS && ndet < 32) {
+        det_pos[ndet] = r->pos;
+        det_t[ndet] = 0.08f + frand() * 0.08f;
+        ndet++;
+    }
+    int mult = 1 + (G.chain - 1 < 28 ? G.chain - 1 : 28) / 4;
+    return mult >= 3 ? 1.0f + 0.5f * mod_rank(MOD_BOUNTY) : 1.0f;
+}
+
+static void detonators_update(float dt) {
+    for (int i = 0; i < ndet;) {
+        det_t[i] -= dt;
+        if (det_t[i] > 0) { i++; continue; }
+        V2 at = det_pos[i];
+        det_pos[i] = det_pos[ndet - 1];
+        det_t[i] = det_t[ndet - 1];
+        ndet--;
+        explode(at, 75, 32, true, -1, rgba(1, 0.45f, 0.25f, 1), DS_SAFE);
+    }
+}
+
+static V2 drone_pos(void) { return v2add(W.pl.pos, v2scale(v2fromang(W.pl.drone_ang), 34)); }
+
+/* Guardian Drone: orbits the ship and snipes the nearest visible robot */
+static void drone_update(float dt) {
+    Player *p = &W.pl;
+    p->drone_ang = wrap_angle(p->drone_ang + 2.2f * dt);
+    p->drone_cd -= dt;
+    if (p->drone_cd > 0) return;
+    V2 dp = drone_pos();
+    int best = -1;
+    float bd = 460;
+    for (int i = 0; i < MAX_ROBOTS; i++) {
+        Robot *r = &W.rob[i];
+        if (!r->active) continue;
+        if (r->type == RB_BOSS && r->invis_t > 0) continue;
+        if (RDEF[r->type].cloaked && r->cloak_vis < 0.5f) continue;
+        float d = v2dist(r->pos, dp);
+        if (d < bd && in_view(r->pos, 0) && los(dp, r->pos)) { bd = d; best = i; }
+    }
+    if (best < 0 && W.reactor.exists && !W.reactor.dead && v2dist(W.reactor.pos, dp) < bd && in_view(W.reactor.pos, 0) && los(dp, W.reactor.pos))
+        best = -2;
+    if (best == -1) { p->drone_cd = 0.15f; return; }
+    V2 target = best >= 0 ? W.rob[best].pos : W.reactor.pos;
+    V2 dir = v2norm(v2sub(target, dp));
+    Proj *pr = spawn_proj(PR_LASER, safe_muzzle(p->pos, dp), v2add(v2scale(dir, 1000), v2scale(p->vel, 0.3f)), 7, 0.6f);
+    if (pr) pr->col = rgba(1, 0.85f, 0.3f, 1);
+    snd_play(SND_LASER, 0.14f, 1.6f);
+    p->drone_cd = mod_rank(MOD_DRONE) >= 2 ? 0.28f : 0.55f;
+}
+
+/* salvage and hostages weigh the ship down until they are banked at the exit */
+static float ship_mass(void) {
+    const Player *p = &W.pl;
+    float hostages = mod_on(MOD_LIFESUPPORT) ? 0 : G.hostages_onboard * 0.1f;
+    float m = 1.0f + (p->cargo * 0.0015f * mod_cargo_k() + hostages) * run_cargo_mult();
+    return minf(m, 3.0f);
 }
 
 static void player_update(float dt) {
@@ -1324,7 +1903,14 @@ static void player_update(float dt) {
     p->warn_cd -= dt;
     p->bump_cd -= dt;
     p->scrape_cd -= dt;
+    p->jettison_cd -= dt;
     p->muzzle_flash = maxf(0, p->muzzle_flash - dt * 12);
+    p->salvage_snd_t -= dt;
+    p->reactive_cd -= dt;
+    p->phase_t = maxf(0, p->phase_t - dt);
+    p->phase_cd -= dt;
+    p->calm_t += dt;
+    if (p->calm_t > 4.0f && p->shield < mod_repair_cap()) p->shield = minf(mod_repair_cap(), p->shield + mod_repair_rate() * dt);
     if (p->cloak_t > 0 && p->cloak_t < dt * 1.5f) hud_msg("CLOAK DEACTIVATED", C_GREY);
     if (p->invuln_t > 0 && p->invuln_t < dt * 1.5f) hud_msg("INVULNERABILITY EXPIRED", C_GREY);
 
@@ -1339,7 +1925,8 @@ static void player_update(float dt) {
     }
     p->ang = approach_angle(p->ang, target_ang, 22.0f * dt);
 
-    /* movement */
+    /* movement: a heavy ship accelerates slowly and coasts further */
+    p->mass = lerpf(p->mass, ship_mass(), damp_factor(6, dt));
     V2 mv = g_in.move;
     if (v2len(mv) > 1) mv = v2norm(mv);
     if (g_cfg.move_mode == 1 && !g_in.use_stick) {
@@ -1347,21 +1934,29 @@ static void player_update(float dt) {
         mv = v2add(v2scale(fw, -g_in.move.y), v2scale(rt, g_in.move.x));
         if (v2len(mv) > 1) mv = v2norm(mv);
     }
-    float accel = 1250, drag = 3.6f;
+    float accel = 1250 * mod_accel() / p->mass, drag = 3.6f / sqrtf(p->mass);
+    if (mod_on(MOD_OVERDRIVE) && G.reactor_dead) accel *= 1.2f;
     float ml = v2len(mv);
     bool burn = g_in.burner && p->burner > 0.02f && ml > 0.1f;
     if (burn) {
         accel *= 2.0f;
-        drag = 3.9f;
-        p->burner = maxf(0, p->burner - 0.42f * dt);
+        drag = 3.9f / sqrtf(p->mass);
+        p->burner = maxf(0, p->burner - 0.42f * mod_burner_drain() * dt);
     } else {
-        p->burner = minf(1, p->burner + 0.16f * dt);
+        p->burner = minf(1, p->burner + 0.16f * mod_burner_regen() * dt);
     }
     p->burning = burn;
+    if (burn && !p->was_burning && mod_on(MOD_PHASE) && p->phase_cd <= 0) {
+        p->phase_t = 0.5f;
+        p->phase_cd = 2.5f;
+        fx_ring(p->pos, 8, 46, C_CYAN, 0.3f, 4);
+        snd_play(SND_CLOAK, 0.4f, 1.6f);
+    }
+    p->was_burning = burn;
     p->vel = v2mad(p->vel, mv, accel * dt);
     p->vel = v2scale(p->vel, 1.0f - minf(1, drag * dt));
     p->thrust = lerpf(p->thrust, ml * (burn ? 1.6f : 1.0f), damp_factor(10, dt));
-    if (p->burn_voice) snd_loop_set(p->burn_voice, burn ? 0.55f : 0.0f, 1.0f);
+    if (p->burn_voice) snd_loop_set(p->burn_voice, burn ? 0.55f : 0.0f, 1.0f / sqrtf(p->mass));
 
     /* exhaust particles */
     if (ml > 0.1f) {
@@ -1374,7 +1969,7 @@ static void player_update(float dt) {
             fx_spark(at, v2add(v2add(v2scale(back, 220 + frand() * 150), v2scale(p->vel, 0.5f)), v2scale(v2fromang(frand() * TAU), 40)),
                      c, 0.22f + frand() * 0.12f, burn ? 3.4f : 2.8f);
         }
-        grid_impulse(v2mad(p->pos, mv, -20), 60, (burn ? 70 : 30) * ml * dt * 60 * 0.12f);
+        grid_impulse(v2mad(p->pos, mv, -20), 60, (burn ? 70 : 30) * ml * dt * 60 * 0.12f * p->mass);
     }
 
     /* integrate + collide */
@@ -1385,19 +1980,22 @@ static void player_update(float dt) {
     bool hit_wall = false;
     for (int i = 0; i < steps; i++) {
         p->pos = v2add(p->pos, v2scale(delta, 1.0f / steps));
-        if (circle_collide(&p->pos, p->radius, &p->vel, 0.3f)) hit_wall = true;
+        if (circle_collide(&p->pos, p->radius, &p->vel, 0.3f / p->mass)) hit_wall = true;
     }
     if (hit_wall && sp_before > 220 && p->scrape_cd <= 0) {
-        snd_play(SND_WALL, clampf(sp_before / 600, 0.2f, 0.7f), 0.7f);
+        snd_play(SND_WALL, clampf(sp_before / 600, 0.2f, 0.7f), 0.7f / sqrtf(p->mass));
         fx_burst(p->pos, 6, rgba(0.7f, 0.9f, 1, 1), 150, 0.25f, 2.5f);
         p->scrape_cd = 0.25f;
-        shake_add(0.05f);
+        shake_add(0.05f * p->mass);
     }
+
+    if (burn && mod_on(MOD_RAM)) ram_robots();
 
     /* energy center */
     int tx = tx_of(p->pos.x), ty = tx_of(p->pos.y);
-    if (tile_in(tx, ty) && (L.flags[ty][tx] & TF_ENERGY) && p->energy < 100) {
-        p->energy = minf(100, p->energy + 32 * dt);
+    float ecap = mod_start_energy();
+    if (tile_in(tx, ty) && (L.flags[ty][tx] & TF_ENERGY) && p->energy < ecap) {
+        p->energy = minf(ecap, p->energy + 32 * mod_energy_center_rate() * dt);
         p->energy_snd_t -= dt;
         if (p->energy_snd_t <= 0) {
             p->energy_snd_t = 0.09f;
@@ -1408,19 +2006,27 @@ static void player_update(float dt) {
 
     fire_primary(dt);
     fire_secondary();
+    if (g_in.jettison) jettison_cargo();
+    if (mod_on(MOD_DRONE)) drone_update(dt);
 }
 
 /* ------------------------------------------------------------ self destruct */
 void start_self_destruct(V2 at) {
     if (G.reactor_dead) return;
     G.reactor_dead = true;
-    float cd = DIFF_COUNTDOWN[G.difficulty] + cur_def()->countdown_bonus;
-    G.countdown = G.countdown_max = cd;
     int xs[64], ys[64], n = 0;
     for (int y = 0; y < L.h; y++)
         for (int x = 0; x < L.w; x++)
             if ((L.flags[y][x] & TF_EXIT) && n < 64) { xs[n] = x; ys[n] = y; n++; }
     flow_compute_multi(L.exitflow, xs, ys, n, true);
+    /* the fuse is longer the further the exit: the mines are big */
+    int tx = clampi(tx_of(at.x), 0, L.w - 1), ty = clampi(tx_of(at.y), 0, L.h - 1);
+    float path = L.exitflow[ty][tx] < 60000 ? (float)L.exitflow[ty][tx] : 80;
+    float cd = DIFF_COUNTDOWN[G.difficulty] + maxf(0, path - 50) * 0.28f - (run_protocol(TP_FUSE) ? 8 : 0);
+    if (run_hazard() == HZ_FUSE) cd *= 0.75f;
+    cd = maxf(15, cd) + mod_countdown_bonus();
+    G.countdown = G.countdown_max = cd;
+    if (!G.boss_level && G.level_time < 150) profile_complete(CH_SPEED);
     for (int i = 0; i < W.nmat; i++) {
         W.mat[i].triggered = true;
         W.mat[i].max += 2 + G.difficulty / 2;
@@ -1430,15 +2036,15 @@ void start_self_destruct(V2 at) {
     hud_msg(G.boss_level ? "THE OVERSEER IS DESTROYED!" : "REACTOR DESTROYED!", C_YELLOW);
     hud_msg("SELF-DESTRUCT SEQUENCE ACTIVATED", C_RED);
     hud_msg("ESCAPE THROUGH THE EXIT TUNNEL!", C_WHITE);
+    if (W.nvaults > 0) hud_msg(W.nvaults > 1 ? "THE VAULTS ARE OPEN - IF YOU DARE" : "THE VAULT IS OPEN - IF YOU DARE", powerup_color(PU_SALVAGE));
     W.alarm_t = 0.5f;
     W.time_scale = 0.3f;
     W.beep_sec = 999;
     W.quake_t = 1.5f;
-    if (!G.boss_level) game_add_score(5000 * (G.level + 1));
+    if (!G.boss_level) game_add_score((int)(5000 * (run_tier() + 1)));
     shake_add(0.8f);
     W.flash = 0.8f;
     W.flash_col = rgba(1, 1, 1, 1);
-    (void)at;
 }
 
 static void countdown_update(float dt) {
@@ -1479,6 +2085,8 @@ static void countdown_update(float dt) {
     if (G.countdown <= 0) {
         G.countdown = 0;
         G.failing = true;
+        W.last_src = DS_BLAST;
+        W.last_proj = -1;
         G.fail_t = 0;
         stop_charge();
         snd_play(SND_EXPL_L, 1.0f, 0.7f);
@@ -1514,7 +2122,10 @@ static void escape_update(float dt) {
             if (G.lives > 0) {
                 G.lives--;
                 G.result = GR_ESCAPE_FAIL;
-            } else G.result = GR_GAME_OVER;
+            } else {
+                snprintf(R.killed_by, sizeof(R.killed_by), "%s", game_killer_text());
+                G.result = GR_GAME_OVER;
+            }
         }
         return;
     }
@@ -1523,6 +2134,7 @@ static void escape_update(float dt) {
     if (tile_in(tx, ty) && (L.flags[ty][tx] & TF_EXIT)) {
         G.escaping = true;
         G.escape_t = 0;
+        G.escape_margin = G.countdown;
         stop_charge();
         if (p->burn_voice) snd_loop_set(p->burn_voice, 0, 1);
         snd_play(SND_TELEPORT, 0.8f, 0.8f);
@@ -1533,16 +2145,52 @@ static void escape_update(float dt) {
 
 void game_end_level(void) {
     Player *p = &W.pl;
+    float tier = run_tier();
     int saved = G.hostages_onboard;
     G.hostages_saved = saved;
-    G.bonus_shield = (int)p->shield * 10;
-    G.bonus_energy = (int)p->energy * 5;
+    G.bonus_shield = (int)p->shield * 10 + (int)p->energy * 5;
     G.bonus_hostage = saved * 1000;
-    G.bonus_full = (G.hostages_total > 0 && saved == G.hostages_total) ? 2500 * (G.level + 1) : 0;
-    G.bonus_skill = G.difficulty * 1500 * (G.level + 1);
-    int total = G.bonus_shield + G.bonus_energy + G.bonus_hostage + G.bonus_full + G.bonus_skill;
+    G.bonus_full = (G.hostages_total > 0 && saved == G.hostages_total) ? (int)(2500 * (tier + 1)) : 0;
+    G.bonus_skill = (int)((G.difficulty * 1500 + run_heat() * 800) * (tier + 1));
+    int total = G.bonus_shield + G.bonus_hostage + G.bonus_full + G.bonus_skill;
     game_add_score(total);
+    /* the hold is banked, and rescued crews and a full rescue pay out salvage too */
+    int crew = (int)((saved * 8 + (G.bonus_full > 0 ? 25 * (tier + 1) : 0)) * run_salvage_mult() * mod_salvage_mult() + 0.5f);
+    G.cargo_banked = p->cargo + crew;
+    G.cargo_bonus = mod_on(MOD_ADRENALINE) && G.escape_margin < 10 ? (p->cargo + 1) / 2 : 0;
+    R.salvage += G.cargo_banked + G.cargo_bonus;
+    p->cargo = 0;
     G.hostages_onboard = 0;
+    run_sector_escaped();
+    profile_complete(CH_ESCAPE);
+    if (G.escape_margin < 3) profile_complete(CH_CLOSE);
+    if (G.cargo_banked + G.cargo_bonus >= 400) profile_complete(CH_HAULER);
+    if (G.bonus_full > 0) profile_complete(CH_FULLHOUSE);
+}
+
+/* ------------------------------------------------------------ wakes */
+/* everything flying over the floor ripples the grid: the ship (a full hold makes a heavier wake),
+ * the robots by their mass, and missiles */
+static void wakes_update(float dt) {
+    Player *p = &W.pl;
+    if (!p->dead && !G.escaping)
+        grid_wake(p->pos, p->vel, 58 + 10 * sqrtf(p->mass), (p->burning ? 2000 : 1500) * sqrtf(p->mass), dt);
+    for (int i = 0; i < MAX_ROBOTS; i++) {
+        Robot *r = &W.rob[i];
+        if (!r->active || RDEF[r->type].speed <= 0 || !in_view(r->pos, 200)) continue;
+        float m = sqrtf(minf(RDEF[r->type].mass, 8));
+        /* a cloaked robot only shimmers */
+        float vis = RDEF[r->type].cloaked ? 0.35f + 0.65f * r->cloak_vis : 1.0f;
+        grid_wake(r->pos, r->vel, r->radius * 2.6f + 18, 1000 * m * vis, dt);
+    }
+    for (int i = 0; i < MAX_PROJ; i++) {
+        Proj *pr = &W.proj[i];
+        if (!pr->active) continue;
+        int t = pr->type;
+        if (t != PR_CONCUSSION && t != PR_HOMING && t != PR_SMART && t != PR_MEGA && t != EP_MISSILE && t != EP_HOMING) continue;
+        if (!in_view(pr->pos, 200)) continue;
+        grid_wake(pr->pos, pr->vel, t == PR_MEGA ? 60 : 40, t == PR_MEGA ? 1100 : 600, dt);
+    }
 }
 
 /* ------------------------------------------------------------ camera */
@@ -1554,8 +2202,12 @@ static void camera_update(float dt) {
         else look = v2add(look, v2clamplen(v2scale(v2sub(g_in.aim_world, p->pos), 0.22f), 170));
         look = v2mad(look, p->vel, 0.12f);
     }
+    V2 was = g_cam.pos;
     g_cam.pos = v2lerp(g_cam.pos, look, damp_factor(G.escaping ? 1.5f : 7.0f, dt));
-    if (!G.escaping) W.zoom_target = p->burning ? BASE_ZOOM * 0.92f : BASE_ZOOM;
+    /* the eye lags behind the camera's motion; at rest it is straight overhead again */
+    V2 cv = dt > 0 ? v2scale(v2sub(g_cam.pos, was), 1 / dt) : v2(0, 0);
+    g_cam.lean = v2lerp(g_cam.lean, v2clamplen(v2scale(cv, -LEAN_LAG), LEAN_MAX), damp_factor(5, dt));
+    if (!G.escaping) W.zoom_target = (W.arena_fight ? ARENA_ZOOM : BASE_ZOOM) * (p->burning ? 0.94f : 1.0f);
     g_cam.zoom = lerpf(g_cam.zoom, W.zoom_target, damp_factor(2.5f, dt));
     g_trauma = maxf(0, g_trauma - 1.3f * dt);
     float amt = g_cfg.shake == 0 ? 0 : g_cfg.shake == 1 ? 0.5f : 1.0f;
@@ -1568,10 +2220,7 @@ static void camera_update(float dt) {
 /* ------------------------------------------------------------ update */
 void game_update(float dt) {
     if (G.result != GR_NONE) return;
-    if (G.automap) {
-        G.automap_pan = v2mad(G.automap_pan, g_in.move, 900 * dt / maxf(G.automap_zoom, 0.3f));
-        return;
-    }
+    if (G.automap) return; /* automap_update turns and pans the map */
     float real_dt = dt;
     W.time_scale = minf(1.0f, W.time_scale + real_dt * 1.4f);
     dt *= W.time_scale;
@@ -1580,7 +2229,7 @@ void game_update(float dt) {
     Player *p = &W.pl;
     /* first-mine tutorial hints and contextual tips */
     W.tut_t += real_dt;
-    if (G.level == 0 && W.tut_step < 3) {
+    if (G.level == 0 && W.tut_step < 3 && g_prof.runs < 2) {
         static const float at[3] = {1.0f, 8.0f, 15.0f};
         if (W.tut_t > at[W.tut_step]) {
             static const char *kb[3] = {"WASD TO FLY   -   MOUSE TO AIM   -   LEFT BUTTON TO FIRE",
@@ -1598,16 +2247,17 @@ void game_update(float dt) {
         hud_hint("ENERGY LOW - RECHARGE AT A YELLOW ENERGY CENTER OR GRAB ENERGY ORBS");
     }
     if (!p->dead && !G.escaping && !G.failing) {
-        if (g_in.select >= 0 && g_in.select < 5) select_primary(g_in.select, true);
-        else if (g_in.select >= 5) select_secondary(g_in.select - 5, true);
-        if (g_in.cycle_p) cycle_primary(g_in.cycle_p);
-        if (g_in.cycle_s) cycle_secondary(g_in.cycle_s);
+        if (g_in.select == 0) select_primary(PW_LASER, true);
+        else if (g_in.select == 1 && p->special >= 0) select_primary(p->special, true);
+        else if (g_in.select == 1) select_primary(-1, true);
+        if (g_in.cycle_p && p->special >= 0) select_primary(p->primary == PW_LASER ? p->special : PW_LASER, true);
     }
     g_in.select = -1;
-    g_in.cycle_p = g_in.cycle_s = 0;
+    g_in.cycle_p = 0;
 
     player_update(dt);
-    g_in.drop_bomb = false;
+    g_in.jettison = false;
+    g_in.fire2_pressed = false;
     doors_update(dt);
     W.flow_t -= dt;
     if (W.flow_t <= 0 && !p->dead) {
@@ -1617,18 +2267,29 @@ void game_update(float dt) {
     W.explore_t -= dt;
     if (W.explore_t <= 0 && !p->dead) {
         W.explore_t = 0.12f;
-        explore_update(p->pos, 440);
+        explore_update(p->pos, run_hazard() == HZ_BLACKOUT ? 190 : 440);
     }
+    W.arena_fight = false;
     robots_update(dt);
     reactor_update(dt);
     matcens_update(dt);
+    traps_update(dt);
+    W.graze_snd_t -= dt;
+    W.hazard_cd -= dt;
+    if (W.hazard_acc > 0 && W.hazard_cd <= 0) {
+        player_damage(W.hazard_acc, W.hazard_dir, W.hazard_src);
+        W.hazard_acc = 0;
+        W.hazard_cd = 0.12f;
+    }
     nshootable = 0;
     for (int i = 0; i < MAX_PROJ && nshootable < 512; i++)
         if (W.proj[i].active && IS_ENEMY_PROJ(W.proj[i].type) && W.proj[i].hp > 0) shootable[nshootable++] = i;
     for (int i = 0; i < MAX_PROJ; i++)
         if (W.proj[i].active) proj_update(&W.proj[i], dt);
     powerups_update(dt);
+    g_in.swap = false;
     hostages_update(dt);
+    detonators_update(dt);
     if (W.boss_death_t > 0) {
         W.boss_death_t -= dt;
         if (frand() < dt * 18) {
@@ -1638,7 +2299,7 @@ void game_update(float dt) {
             shake_add(0.08f);
         }
         if (W.boss_death_t <= 0) {
-            explode(W.boss_death_pos, 260, 0, true, -1, rgba(1, 0.4f, 0.8f, 1));
+            explode(W.boss_death_pos, 260, 0, true, -1, rgba(1, 0.4f, 0.8f, 1), DS_SELF);
             fx_explosion(W.boss_death_pos, 140, C_WHITE);
             start_self_destruct(W.boss_death_pos);
         }
@@ -1650,6 +2311,7 @@ void game_update(float dt) {
         if (G.chain_t <= 0) G.chain = 0;
     }
     fx_update(dt);
+    wakes_update(dt);
     grid_update(dt);
     hud_update(real_dt);
     camera_update(real_dt);
@@ -1657,11 +2319,39 @@ void game_update(float dt) {
 }
 
 /* ------------------------------------------------------------ drawing */
-static void draw_rock(Col rock, Col accent) {
+/* where the tops of the walls are drawn: off their feet while the eye leans */
+static V2 wall_top(void) { return v2scale(g_cam.lean, -WALL_LEAN); }
+static void tops_push(void) { r_push(v2scale(wall_top(), g_cam.zoom), v2(0, 0), 1, 1, 1); }
+/* how much of the walls' sides shows, 0 straight overhead */
+static float lean_k(void) { return clampf((v2len(wall_top()) - 0.1f) / 6.0f, 0, 1); }
+
+/* a wall's side from its foot a-b up to its shifted top, if the leaning eye sees it */
+static void wall_side(V2 a, V2 b, V2 n, Col foot, Col top) {
+    V2 T = wall_top();
+    if (v2dot(n, T) > -0.01f) return;
+    static const int idx[6] = {0, 1, 2, 0, 2, 3};
+    V2 p[4] = {w2v(a), w2v(b), w2v(v2add(b, T)), w2v(v2add(a, T))};
+    Col c[4] = {foot, foot, top, top};
+    r_mesh(p, c, 4, idx, 6);
+}
+
+static void draw_rock(Col rock, Col accent, Col wall) {
     V2 tl = v2w(v2(-20, -20)), br = v2w(v2(g_virt_w + 20, VIRT_H + 20));
-    int x0 = tx_of(tl.x), x1 = tx_of(br.x);
-    int y0 = tx_of(tl.y), y1 = tx_of(br.y);
+    int x0 = tx_of(tl.x) - 1, x1 = tx_of(br.x) + 1;
+    int y0 = tx_of(tl.y) - 1, y1 = tx_of(br.y) + 1;
     Col brk = col_lerp(rock, accent, 0.18f);
+    /* the sides first, under the tops: dark at the foot, lit toward the light */
+    if (lean_k() > 0) {
+        const V2 light = v2norm(v2(-0.55f, -0.65f));
+        for (int i = 0; i < L.nsegs; i++) {
+            const Seg *s = &L.segs[i];
+            if (!rw_visible(v2scale(v2add(s->a, s->b), 0.5f), v2dist(s->a, s->b) * 0.5f + 40)) continue;
+            Col c = s->tile >= 0 ? brk : rock;
+            float lit = 0.5f + 0.5f * v2dot(s->n, light);
+            wall_side(s->a, s->b, s->n, col_mul(c, 0.6f), col_lerp(c, wall, 0.1f + 0.3f * lit));
+        }
+    }
+    tops_push();
     for (int y = y0; y <= y1; y++)
         for (int x = x0; x <= x1; x++) {
             uint8_t t = tile_in(x, y) ? L.tile[y][x] : T_SOLID;
@@ -1678,6 +2368,7 @@ static void draw_rock(Col rock, Col accent) {
             case T_TRI_BR: r_rock_tri(b, c, d, ub, uc, ud, rock); break;
             }
         }
+    r_pop();
 }
 
 static void draw_floor(void) {
@@ -1723,6 +2414,20 @@ static void draw_floor(void) {
 }
 
 static void draw_walls(Col wall, Col accent) {
+    /* the feet of the sides the leaning eye sees, and the edges up their corners */
+    float lk = lean_k();
+    if (lk > 0) {
+        V2 T = wall_top();
+        for (int i = 0; i < L.nsegs; i++) {
+            const Seg *s = &L.segs[i];
+            if (v2dot(s->n, T) > -0.01f) continue;
+            if (!rw_visible(v2scale(v2add(s->a, s->b), 0.5f), v2dist(s->a, s->b) * 0.5f + 40)) continue;
+            rw_line(s->a, s->b, 3, col_a(wall, 0.35f * lk));
+            rw_line(s->a, v2add(s->a, T), 2.5f, col_a(wall, 0.5f * lk));
+            rw_line(s->b, v2add(s->b, T), 2.5f, col_a(wall, 0.5f * lk));
+        }
+    }
+    tops_push();
     /* soft inner glow into the rock */
     for (int i = 0; i < L.nsegs; i++) {
         const Seg *s = &L.segs[i];
@@ -1780,6 +2485,7 @@ static void draw_walls(Col wall, Col accent) {
         rw_polyline(zig, 3, false, 2.5f, col_a(accent, 0.35f));
         (void)c;
     }
+    r_pop();
 }
 
 static void draw_doors(void) {
@@ -1790,6 +2496,18 @@ static void draw_doors(void) {
         Col col = key_color(d->lock);
         bool locked = !can_open(d);
         float t = W.time;
+        SDL_FRect r[2];
+        bool slab = door_rects(d, &r[0], &r[1]);
+        /* the slabs stand as high as the walls: their sides show while the eye leans */
+        if (slab && lean_k() > 0)
+            for (int k = 0; k < 2; k++) {
+                if (r[k].w < 1 || r[k].h < 1) continue;
+                V2 q[4] = {v2(r[k].x, r[k].y), v2(r[k].x + r[k].w, r[k].y), v2(r[k].x + r[k].w, r[k].y + r[k].h), v2(r[k].x, r[k].y + r[k].h)};
+                static const V2 N[4] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
+                Col foot = rgba(col.r * 0.05f, col.g * 0.05f, col.b * 0.05f, 1), top = rgba(col.r * 0.3f, col.g * 0.3f, col.b * 0.3f, 1);
+                for (int e = 0; e < 4; e++) wall_side(q[e], q[(e + 1) % 4], N[e], foot, top);
+            }
+        tops_push();
         /* frame markers on the walls */
         V2 e0, e1, perp;
         if (d->horiz) {
@@ -1803,8 +2521,10 @@ static void draw_doors(void) {
         }
         rw_line(v2mad(e0, perp, -12), v2mad(e0, perp, 12), 6, col_a(col, 0.8f));
         rw_line(v2mad(e1, perp, -12), v2mad(e1, perp, 12), 6, col_a(col, 0.8f));
-        SDL_FRect r[2];
-        if (!door_rects(d, &r[0], &r[1])) continue;
+        if (!slab) {
+            r_pop();
+            continue;
+        }
         for (int k = 0; k < 2; k++) {
             if (r[k].w < 1 || r[k].h < 1) continue;
             V2 a = w2v(v2(r[k].x, r[k].y)), b = w2v(v2(r[k].x + r[k].w, r[k].y + r[k].h));
@@ -1825,11 +2545,12 @@ static void draw_doors(void) {
             V2 dm[4] = {v2add(c, v2(0, -11)), v2add(c, v2(11, 0)), v2add(c, v2(0, 11)), v2add(c, v2(-11, 0))};
             rw_polyline(dm, 4, true, 4, col_a(col, pulse));
             rw_glow(c, 26, col_a(col, 0.25f * pulse));
-            if (d->lock == LOCK_EXIT) {
+            if (d->lock == LOCK_EXIT || d->lock == LOCK_VAULT) {
                 V2 v = w2v(v2mad(c, perp, -26));
-                r_text("EXIT", v.x, v.y - 5, 10 * g_cam.zoom, col_a(col, 0.9f), AL_CENTER);
+                r_text(d->lock == LOCK_EXIT ? "EXIT" : "VAULT", v.x, v.y - 5, 10 * g_cam.zoom, col_a(col, 0.9f), AL_CENTER);
             }
         }
+        r_pop();
     }
 }
 
@@ -1925,6 +2646,18 @@ static void draw_projectiles(void) {
             rw_glow(p->pos, 16, col_a(c, 0.7f));
             rw_glow(p->pos, 6, col_a(C_WHITE, 0.8f));
             break;
+        case PR_CARGO: {
+            /* a spinning crate, blinking faster as the fuse runs out */
+            float r = p->radius, a = p->age * 5;
+            float blink = fmodf(t * (4 + 14 * (1 - p->life / 1.1f)), 1.0f) < 0.5f ? 1.0f : 0.35f;
+            V2 sq[4];
+            for (int k = 0; k < 4; k++) sq[k] = v2add(p->pos, v2scale(v2fromang(a + k * TAU / 4 + PI / 4), r));
+            rw_polyline(sq, 4, true, 4, c);
+            rw_line(sq[0], sq[2], 2.5f, col_a(c, 0.6f));
+            rw_line(sq[1], sq[3], 2.5f, col_a(c, 0.6f));
+            rw_glow(p->pos, r * 2.4f, col_a(col_white(c, 0.3f), 0.45f * blink));
+            rw_circle(p->pos, r * 1.6f + 20 * (p->life / 1.1f), 2, col_a(c, 0.25f), 24);
+        } break;
         case PR_PROX:
         case EP_MINE: {
             float a = t * 3 + i;
@@ -1959,6 +2692,31 @@ static void draw_projectiles(void) {
             rw_glow(p->pos, 20, col_a(c, 0.6f));
             rw_line(v2mad(p->pos, d, -14), v2mad(p->pos, d, 4), 6, col_white(c, 0.4f));
             break;
+        case EP_PELLET:
+            /* bullet hell needs readable bullets: a coloured halo and a white-hot core */
+            rw_glow(p->pos, 15, col_a(c, 0.7f));
+            rw_glow(p->pos, 6.5f, col_a(C_WHITE, 0.95f));
+            break;
+        case EP_SHARD:
+            rw_line(v2mad(p->pos, d, -13), v2mad(p->pos, d, 5), 6, c);
+            rw_line(v2mad(p->pos, d, -8), v2mad(p->pos, d, 3), 2.5f, C_WHITE);
+            rw_glow(p->pos, 11, col_a(c, 0.35f));
+            break;
+        case EP_FLAK: {
+            float pul = 0.75f + 0.25f * sinf(t * 26 + i);
+            float fuse = clampf(p->life / 0.3f, 0, 1);
+            rw_glow(p->pos, 28 * pul, col_a(c, 0.6f));
+            rw_circle(p->pos, 10, 3.5f, col_white(c, 0.4f), 12);
+            rw_circle(p->pos, 10 + 22 * (1 - fuse), 2, col_a(c, 0.5f * (1 - fuse)), 16);
+        } break;
+        case EP_SEEKER: {
+            float a = t * 5 + i;
+            V2 tri[3];
+            for (int k = 0; k < 3; k++) tri[k] = v2add(p->pos, v2scale(v2fromang(a + k * TAU / 3), 11));
+            rw_polyline(tri, 3, true, 3, c);
+            rw_glow(p->pos, 20, col_a(c, 0.55f + 0.2f * sinf(t * 14 + i)));
+            rw_glow(p->pos, 5, col_a(C_WHITE, 0.9f));
+        } break;
         }
     }
 }
@@ -1978,7 +2736,38 @@ static void draw_player(void) {
         rw_glow(back, 10 + th * 12, col_a(ec, 0.55f * alpha * minf(1, th)));
     }
     rw_glow(p->pos, 46, col_a(rgba(0.4f, 0.7f, 1, 1), 0.10f * alpha));
+    if (p->phase_t > 0) {
+        /* phase shift afterimages trail behind the ship */
+        for (int k = 1; k <= 3; k++)
+            rw_shape(&SHIP_SHAPE, v2mad(p->pos, p->vel, -0.025f * k), p->ang, 16, 3, col_a(C_CYAN, 0.35f * p->phase_t / 0.5f / k));
+        hull = col_white(col_a(C_CYAN, alpha), 0.5f);
+    }
     rw_shape(&SHIP_SHAPE, p->pos, p->ang, 16, 5, hull);
+    /* the hold: a tail of cargo pods that grows and sways with the mass */
+    int pods = (int)ceilf((p->mass - 1.0f) / 0.12f);
+    if (pods > 0) {
+        Col pc = col_a(powerup_color(PU_SALVAGE), alpha);
+        V2 back_dir = v2fromang(p->ang + PI);
+        V2 prev = v2mad(p->pos, back_dir, 12);
+        for (int k = 0; k < pods && k < 12; k++) {
+            float sway = sinf(t * 3 - k * 0.7f) * (2 + k * 1.0f);
+            V2 at = v2add(v2mad(p->pos, back_dir, 24 + k * 12.0f), v2scale(v2perp(back_dir), sway));
+            rw_line(prev, at, 2.5f, col_a(pc, 0.45f));
+            float rr = 6.5f - k * 0.2f;
+            V2 dm[4] = {v2add(at, v2(0, -rr)), v2add(at, v2(rr, 0)), v2add(at, v2(0, rr)), v2add(at, v2(-rr, 0))};
+            rw_polyline(dm, 4, true, 3, pc);
+            rw_glow(at, rr * 2.2f, col_a(pc, 0.18f));
+            prev = at;
+        }
+    }
+    if (mod_on(MOD_DRONE)) {
+        V2 dp = drone_pos();
+        Col dc = col_a(rgba(1, 0.85f, 0.3f, 1), alpha);
+        V2 tri[3];
+        for (int k = 0; k < 3; k++) tri[k] = v2add(dp, v2scale(v2fromang(p->drone_ang * 3 + k * TAU / 3), 6));
+        rw_polyline(tri, 3, true, 3, dc);
+        rw_glow(dp, 14, col_a(dc, 0.35f));
+    }
     if (p->muzzle_flash > 0) {
         Col mc = p->primary == PW_LASER ? LASER_COL[p->laser_level] : PINFO[p->primary == PW_VULCAN ? PR_VULCAN : p->primary == PW_SPREAD ? PR_SPREAD : p->primary == PW_PLASMA ? PR_PLASMA : PR_FUSION].col;
         rw_glow(ship_local(v2(9, 11.5f)), 10 * p->muzzle_flash, col_a(mc, 0.8f));
@@ -2056,11 +2845,13 @@ void game_draw(void) {
         wall = col_mul(rgba(1, 0.28f, 0.16f, 1), 0.75f + 0.25f * k);
         grid = col_mul(rgba(0.5f, 0.06f, 0.08f, 1), 0.8f + 0.4f * k);
     }
+    backdrop_draw(wall, grid, d->rock, d->accent, t);
     grid_draw(grid, 1.0f);
-    draw_rock(d->rock, d->accent);
+    draw_rock(d->rock, d->accent, wall);
     draw_floor();
     draw_walls(wall, d->accent);
     draw_doors();
+    traps_draw();
     matcens_draw();
     draw_powerups();
     draw_hostages();

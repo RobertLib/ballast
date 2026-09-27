@@ -1,5 +1,5 @@
 /*
- * HUD, message queue, automap and powerup icons.
+ * HUD, message queue and powerup icons.
  */
 #include "game_internal.h"
 
@@ -58,8 +58,7 @@ Col powerup_color(int type) {
     case PU_ENERGY: return rgba(1, 0.85f, 0.2f, 1);
     case PU_LASER: return rgba(1, 0.35f, 0.3f, 1);
     case PU_QUAD: return rgba(0.4f, 1, 0.5f, 1);
-    case PU_VULCAN:
-    case PU_VAMMO: return rgba(1, 0.8f, 0.4f, 1);
+    case PU_VULCAN: return rgba(1, 0.8f, 0.4f, 1);
     case PU_SPREAD: return rgba(0.4f, 0.65f, 1, 1);
     case PU_PLASMA: return rgba(0.3f, 1, 0.6f, 1);
     case PU_FUSION: return rgba(0.75f, 0.45f, 1, 1);
@@ -71,6 +70,9 @@ Col powerup_color(int type) {
     case PU_CLOAK: return rgba(0.7f, 0.8f, 1, 1);
     case PU_INVULN: return rgba(1, 0.95f, 0.4f, 1);
     case PU_LIFE: return rgba(0.5f, 1, 0.6f, 1);
+    case PU_SALVAGE: return rgba(1, 0.68f, 0.2f, 1);
+    case PU_TREASURE: return rgba(1, 0.85f, 0.3f, 1);
+    case PU_CRATE: return rgba(1, 0.35f, 0.9f, 1);
     case PU_KEY_BLUE: return key_color(LOCK_BLUE);
     case PU_KEY_YELLOW: return key_color(LOCK_YELLOW);
     case PU_KEY_RED: return key_color(LOCK_RED);
@@ -79,10 +81,11 @@ Col powerup_color(int type) {
 }
 
 const char *powerup_name(int type) {
-    static const char *names[PU_TYPES] = {"SHIELD ORB", "ENERGY ORB", "LASER UPGRADE", "QUAD LASERS", "VULCAN CANNON", "VULCAN AMMO",
+    static const char *names[PU_TYPES] = {"SHIELD ORB", "ENERGY ORB", "LASER UPGRADE", "QUAD LASERS", "VULCAN CANNON",
                                           "SPREADFIRE CANNON", "PLASMA CANNON", "FUSION CANNON", "CONCUSSION MISSILES",
                                           "HOMING MISSILES", "PROXIMITY BOMBS", "SMART MISSILES", "MEGA MISSILE",
-                                          "CLOAKING DEVICE", "INVULNERABILITY", "EXTRA LIFE", "BLUE KEY", "YELLOW KEY", "RED KEY"};
+                                          "CLOAKING DEVICE", "INVULNERABILITY", "EXTRA LIFE", "SALVAGE", "VAULT TREASURE", "R&D CRATE",
+                                          "BLUE KEY", "YELLOW KEY", "RED KEY"};
     return type >= 0 && type < PU_TYPES ? names[type] : "?";
 }
 
@@ -94,6 +97,39 @@ static void hex(V2 c, float r, float rot, float w, Col col) {
 
 void draw_powerup_icon(int type, V2 c, float s, float t, float alpha) {
     Col col = col_a(powerup_color(type), alpha);
+    if (type == PU_TREASURE) {
+        /* a heap of shards under a pulsing halo */
+        float pulse = 0.8f + 0.2f * sinf(t * 4);
+        r_glow(c, 46 * s * pulse, col_a(col, 0.3f));
+        for (int k = 0; k < 5; k++) {
+            V2 o = v2add(c, v2scale(v2fromang(k * TAU / 5 + t * 0.6f), (k ? 9 : 0) * s));
+            float r = (k ? 6 : 9) * s, rot = t * 2 + k;
+            V2 dm[4] = {v2add(o, v2scale(v2fromang(rot), r)), v2add(o, v2scale(v2fromang(rot + PI / 2), r * 0.55f)),
+                        v2add(o, v2scale(v2fromang(rot + PI), r)), v2add(o, v2scale(v2fromang(rot + PI * 1.5f), r * 0.55f))};
+            r_polyline(dm, 4, true, 3 * s, col_white(col, 0.3f));
+        }
+        r_circle(c, 20 * s * pulse, 2.5f * s, col_a(col, 0.5f), 24);
+        return;
+    }
+    if (type == PU_CRATE) {
+        float rot = sinf(t * 1.5f) * 0.3f;
+        V2 sq[4];
+        for (int i = 0; i < 4; i++) sq[i] = v2add(c, v2scale(v2fromang(rot + PI / 4 + i * TAU / 4), 16 * s));
+        r_glow(c, 40 * s, col_a(col, 0.25f));
+        r_polyline(sq, 4, true, 4 * s, col);
+        r_line(sq[0], sq[2], 2 * s, col_a(col, 0.4f));
+        r_text("R&D", c.x, c.y - 3.5f * s, 6.5f * s, col_white(col, 0.5f), AL_CENTER);
+        return;
+    }
+    if (type == PU_SALVAGE) {
+        /* small spinning shard instead of a full powerup badge */
+        float r = 6 * s, rot = t * 4;
+        V2 dm[4] = {v2add(c, v2scale(v2fromang(rot), r)), v2add(c, v2scale(v2fromang(rot + PI / 2), r * 0.55f)),
+                    v2add(c, v2scale(v2fromang(rot + PI), r)), v2add(c, v2scale(v2fromang(rot + PI * 1.5f), r * 0.55f))};
+        r_glow(c, 14 * s, col_a(col, 0.3f));
+        r_polyline(dm, 4, true, 2.5f * s, col_white(col, 0.2f));
+        return;
+    }
     float pulse = 0.85f + 0.15f * sinf(t * 5);
     r_glow(c, 30 * s, col_a(col, 0.18f * pulse));
     const char *label = NULL;
@@ -136,7 +172,6 @@ void draw_powerup_icon(int type, V2 c, float s, float t, float alpha) {
         case PU_LASER: label = "L+"; break;
         case PU_QUAD: label = "Q4"; break;
         case PU_VULCAN: label = "VC"; break;
-        case PU_VAMMO: label = "AM"; break;
         case PU_SPREAD: label = "SF"; break;
         case PU_PLASMA: label = "PL"; break;
         case PU_FUSION: label = "FU"; break;
@@ -150,6 +185,19 @@ void draw_powerup_icon(int type, V2 c, float s, float t, float alpha) {
     }
     if (label && type != PU_KEY_BLUE && type != PU_KEY_YELLOW && type != PU_KEY_RED)
         r_text(label, c.x, c.y - 4.5f * s, 9 * s, col_white(col, 0.5f), AL_CENTER);
+}
+
+/* the salvage shard glyph followed by an amount */
+void draw_salvage(const char *text, float x, float y, float size, Col c, int align) {
+    float dw = size * 1.1f;
+    float w = dw + text_width(text, size);
+    float x0 = align == AL_CENTER ? x - w * 0.5f : align == AL_RIGHT ? x - w : x;
+    V2 m = v2(x0 + size * 0.4f, y + size * 0.5f);
+    float r = size * 0.55f;
+    V2 dm[4] = {v2add(m, v2(0, -r)), v2add(m, v2(r * 0.6f, 0)), v2add(m, v2(0, r)), v2add(m, v2(-r * 0.6f, 0))};
+    r_polyline(dm, 4, true, maxf(2.2f, size * 0.22f), c);
+    r_glow(m, size * 1.4f, col_a(c, 0.25f));
+    r_text(text, x0 + dw, y, size, c, AL_LEFT);
 }
 
 /* ------------------------------------------------------------ HUD */
@@ -167,8 +215,8 @@ static void bar(float x, float y, float w, float h, float frac, float frac2, Col
     }
 }
 
-static const char *objective_text(void) {
-    if (G.reactor_dead) return "ESCAPE! FOLLOW THE GREEN ARROWS TO THE EXIT";
+const char *objective_text(void) {
+    if (G.reactor_dead) return W.nvaults > 0 ? "ESCAPE! FOLLOW THE GREEN ARROWS - OR RAID THE VAULTS FIRST" : "ESCAPE! FOLLOW THE GREEN ARROWS TO THE EXIT";
     int need = W.level_keys & ~W.pl.keys;
     if (need & 1) return "FIND THE BLUE ACCESS KEY";
     if (need & 2) return "FIND THE YELLOW ACCESS KEY";
@@ -215,8 +263,24 @@ void game_hud_draw(void) {
     /* lives + level */
     for (int i = 0; i < G.lives && i < 8; i++) game_draw_ship_icon(v2(VW - 34 - i * 30, 40), -PI / 2, 10, rgba(0.7f, 0.9f, 1, 0.9f));
     if (G.lives > 8) r_textf(VW - 280, 34, 12, dim, AL_RIGHT, "%d", G.lives);
-    r_textf(VW - 26, 64, 11, dim, AL_RIGHT, "MINE %d  %s", G.level + 1, cur_def()->name);
-    r_textf(VW - 26, 82, 10, col_a(dim, 0.7f), AL_RIGHT, "%s", DIFF_NAMES[G.difficulty]);
+    r_textf(VW - 26, 64, 11, dim, AL_RIGHT, "SECTOR %d/%d  %s", G.level + 1, R.nlayers, cur_def()->name);
+    int hz = run_hazard();
+    if (hz) r_textf(VW - 26, 82, 10, col_a(C_ORANGE, 0.85f), AL_RIGHT, "%s  -  %s", hazard_name(hz), DIFF_NAMES[G.difficulty]);
+    else r_textf(VW - 26, 82, 10, col_a(dim, 0.7f), AL_RIGHT, "%s%s", DIFF_NAMES[G.difficulty], run_heat() ? "  +HEAT" : "");
+    {
+        /* banked salvage; the hold's contents flash as shards come in */
+        static int shown = -1;
+        static float flash = 0, last_t = 0;
+        flash = maxf(0, flash - (g_time - last_t) * 2.5f);
+        last_t = g_time;
+        if (p->cargo > shown && shown >= 0) flash = 1;
+        shown = p->cargo;
+        char sb[24];
+        snprintf(sb, sizeof(sb), "%d", R.salvage);
+        draw_salvage(sb, VW - 26, 100, 13, col_a(powerup_color(PU_SALVAGE), 0.8f), AL_RIGHT);
+        if (p->cargo > 0)
+            r_textf(VW - 26, 120, 10 + flash * 2, col_white(powerup_color(PU_SALVAGE), flash * 0.6f), AL_RIGHT, "+%d IN THE HOLD", p->cargo);
+    }
 
     /* keys + hostages, top centre */
     float cx = VW * 0.5f;
@@ -266,14 +330,37 @@ void game_hud_draw(void) {
         float f = clampf(b->hp / b->maxhp, 0, 1);
         r_text("THE OVERSEER", cx, VIRT_H - 94, 12, C_MAGENTA, AL_CENTER);
         bar(cx - 220, VIRT_H - 74, 440, 8, f, f, C_MAGENTA, 40);
-    } else if (W.reactor.exists && !W.reactor.dead && v2dist(W.reactor.pos, p->pos) < 720) {
-        float f = clampf(W.reactor.hp / W.reactor.maxhp, 0, 1);
-        r_text("REACTOR CORE INTEGRITY", cx, VIRT_H - 94, 11, cur_def()->accent, AL_CENTER);
-        bar(cx - 180, VIRT_H - 74, 360, 7, f, f, cur_def()->accent, 30);
+    } else if (W.reactor.exists && !W.reactor.dead && (W.reactor.awake || v2dist(W.reactor.pos, p->pos) < 720)) {
+        const Reactor *rc = &W.reactor;
+        float f = clampf(rc->hp / rc->maxhp, 0, 1);
+        Col ac = cur_def()->accent;
+        if (rc->awake) r_textf(cx, VIRT_H - 96, 11, ac, AL_CENTER, "REACTOR CORE  -  PHASE %d OF %d", rc->phase + 1, rc->nphases);
+        else r_text("REACTOR CORE INTEGRITY", cx, VIRT_H - 94, 11, ac, AL_CENTER);
+        bar(cx - 220, VIRT_H - 74, 440, 8, f, f, ac, 40);
+        /* where the phases break */
+        for (int i = 0; i + 1 < rc->nphases; i++) {
+            float x = cx - 220 + 440 * rc->threshold[i] / rc->maxhp;
+            r_line(v2(x, VIRT_H - 80), v2(x, VIRT_H - 60), 3, col_a(C_WHITE, 0.85f));
+        }
+        if (reactor_shielded()) {
+            float pulse = 0.6f + 0.4f * sinf(t * 8);
+            const char *m = rc->vent_t > 0 ? "CORE VENTING" : "SHIELDED  -  DESTROY THE PYLONS";
+            r_text(m, cx, VIRT_H - 56, 10, col_a(RDEF[RB_PYLON].col, pulse), AL_CENTER);
+        }
     }
 
-    /* shields / energy / burner */
+    /* cargo and mass, above the shield */
     float bx = 26, by = VIRT_H - 104;
+    {
+        Col cc = powerup_color(PU_SALVAGE);
+        float heavy = clampf((p->mass - 1) / 1.0f, 0, 1);
+        r_text("CARGO", bx, by - 40, 11, col_a(cc, 0.9f), AL_LEFT);
+        r_textf(bx + 250, by - 44, 18, cc, AL_RIGHT, "%d", p->cargo);
+        Col mc = col_lerp(rgba(0.6f, 0.8f, 1, 0.9f), C_ORANGE, heavy);
+        r_textf(bx + 70, by - 40, 11, col_a(mc, 0.9f), AL_LEFT, "MASS X%.2f", p->mass);
+        bar(bx, by - 22, 250, 6, heavy, heavy, cc, 25);
+    }
+    /* shields / energy / burner */
     Col sc = p->shield < 30 ? col_lerp(C_RED, C_BLUE, 0.5f + 0.5f * sinf(t * 8)) : rgba(0.35f, 0.65f, 1, 1);
     r_text("SHIELD", bx, by, 11, col_a(sc, 0.9f), AL_LEFT);
     r_textf(bx + 250, by - 4, 18, sc, AL_RIGHT, "%d", (int)maxf(0, p->shield));
@@ -288,41 +375,73 @@ void game_hud_draw(void) {
     bar(bx + 58, by + 77, 192, 5, p->burner, p->burner, bc, 16);
     if (p->cloak_t > 0) r_textf(bx + 270, by + 40, 11, rgba(0.7f, 0.8f, 1, 0.9f), AL_LEFT, "CLOAK %d", (int)ceilf(p->cloak_t));
     if (p->invuln_t > 0) r_textf(bx + 270, by + 58, 11, C_YELLOW, AL_LEFT, "INVULN %d", (int)ceilf(p->invuln_t));
+    if (mod_on(MOD_PHOENIX))
+        r_text(W.phoenix_used ? "PHOENIX SPENT" : "PHOENIX READY", bx + 270, by + 76, 8,
+               W.phoenix_used ? col_a(C_GREY, 0.6f) : rgba(1, 0.65f, 0.25f, 0.85f), AL_LEFT);
 
-    /* weapons (stacked bottom-right) */
+    /* weapons (stacked bottom-right): two primary slots, one secondary */
     float wx = VW - 26, wy = VIRT_H - 142;
     Col pc = rgba(0.7f, 0.92f, 1, 1);
     char buf[64];
     r_text("PRIMARY", wx, wy, 10, col_a(pc, 0.7f), AL_RIGHT);
-    switch (p->primary) {
-    case PW_LASER: snprintf(buf, sizeof(buf), "LASER LV%d%s", p->laser_level, p->quad ? " QUAD" : ""); break;
-    case PW_VULCAN: snprintf(buf, sizeof(buf), "VULCAN %d", p->vulcan_ammo); break;
-    default: snprintf(buf, sizeof(buf), "%s", PRIMARY_NAMES[p->primary]); break;
-    }
-    r_text(buf, wx - 150, wy - 3, 15, pc, AL_RIGHT);
-    for (int i = 0; i < PW_COUNT; i++) {
-        bool own = (p->owned & (1 << i)) != 0;
-        float x = wx - (PW_COUNT - 1 - i) * 24 - 6;
-        Col ic = i == p->primary ? pc : col_a(pc, own ? 0.45f : 0.12f);
-        r_textf(x, wy + 20, 11, ic, AL_CENTER, "%d", i + 1);
-        if (i == p->primary) r_line(v2(x - 7, wy + 36), v2(x + 7, wy + 36), 3, pc);
+    if (p->primary == PW_LASER) snprintf(buf, sizeof(buf), "LASER LV%d%s", p->laser_level, p->quad ? " QUAD" : "");
+    else snprintf(buf, sizeof(buf), "%s", PRIMARY_NAMES[p->primary]);
+    r_text(buf, wx - 90, wy - 3, 15, pc, AL_RIGHT);
+    {
+        const char *slot2 = p->special >= 0 ? PRIMARY_NAMES[p->special] : "EMPTY";
+        float x1 = wx - 6, x0 = x1 - text_width(slot2, 10) - 18;
+        r_text("LASER", x0 - 16, wy + 20, 10, p->primary == PW_LASER ? pc : col_a(pc, 0.45f), AL_RIGHT);
+        if (p->primary == PW_LASER) r_line(v2(x0 - 16 - text_width("LASER", 10), wy + 36), v2(x0 - 16, wy + 36), 3, pc);
+        r_text(slot2, x1, wy + 20, 10, p->special < 0 ? col_a(pc, 0.2f) : p->primary == p->special ? pc : col_a(pc, 0.45f), AL_RIGHT);
+        if (p->special >= 0 && p->primary == p->special) r_line(v2(x1 - text_width(slot2, 10), wy + 36), v2(x1, wy + 36), 3, pc);
     }
     Col mc = rgba(1, 0.72f, 0.45f, 1);
     float sy = wy + 58;
     r_text("SECONDARY", wx, sy, 10, col_a(mc, 0.7f), AL_RIGHT);
-    snprintf(buf, sizeof(buf), "%s", SECONDARY_NAMES[p->secondary]);
-    r_text(buf, wx - 150, sy - 3, 15, p->missiles[p->secondary] > 0 ? mc : col_a(mc, 0.4f), AL_RIGHT);
-    for (int i = 0; i < SW_COUNT; i++) {
-        float x = wx - (SW_COUNT - 1 - i) * 24 - 6;
-        Col ic = i == p->secondary ? mc : col_a(mc, p->missiles[i] > 0 ? 0.45f : 0.12f);
-        r_textf(x, sy + 20, 11, ic, AL_CENTER, "%d", p->missiles[i]);
-        if (i == p->secondary) r_line(v2(x - 8, sy + 36), v2(x + 8, sy + 36), 3, mc);
+    if (p->secondary >= 0) snprintf(buf, sizeof(buf), "%s  X%d", SECONDARY_NAMES[p->secondary], p->missiles);
+    else snprintf(buf, sizeof(buf), "EMPTY");
+    r_text(buf, wx - 110, sy - 3, 15, p->secondary >= 0 && p->missiles > 0 ? mc : col_a(mc, 0.4f), AL_RIGHT);
+    if (p->secondary >= 0) {
+        int cap = game_missile_cap(p->secondary);
+        bar(wx - 190, sy + 22, 184, 5, (float)p->missiles / cap, (float)p->missiles / cap, mc, clampi(cap, 1, 20));
     }
     if (p->charging) {
         float k = clampf(p->fusion_charge / 1.6f, 0, 1);
         r_text(p->fusion_charge > 2.4f ? "OVERCHARGE!" : "FUSION CHARGE", wx, wy - 24, 10, p->fusion_charge > 2.4f ? C_RED : C_PURPLE, AL_RIGHT);
         r_add_rect(wx - 140 * k, wy - 8, 140 * k, 4, col_a(C_PURPLE, 0.9f));
-        (void)sy;
+    }
+
+    /* swap prompt for the weapon under the ship */
+    if (p->swap_pu >= 0 && W.pu[p->swap_pu].active && !p->dead) {
+        const Powerup *pu = &W.pu[p->swap_pu];
+        const char *key = g_in.use_stick ? "RB" : "E";
+        if (pu->type >= PU_CONC && pu->type <= PU_MEGA)
+            snprintf(buf, sizeof(buf), "%s  SWAP %s X%d FOR %s X%d", key, SECONDARY_NAMES[p->secondary], p->missiles, SECONDARY_NAMES[pu->type - PU_CONC], pu->amount);
+        else snprintf(buf, sizeof(buf), "%s  SWAP %s FOR %s", key, PRIMARY_NAMES[p->special], powerup_name(pu->type));
+        V2 at = w2v(v2add(pu->pos, v2(0, -40)));
+        float w = text_width(buf, 11) * 0.5f + 14;
+        r_panel(at.x - w, at.y - 8, w * 2, 26, powerup_color(pu->type), 0.7f);
+        r_text(buf, at.x, at.y, 11, col_white(powerup_color(pu->type), 0.4f), AL_CENTER);
+    }
+
+    /* the build: installed modules along the bottom */
+    {
+        int ids[MOD_COUNT], n = 0;
+        for (int i = 0; i < MOD_COUNT; i++)
+            if (R.mods[i] > 0) ids[n++] = i;
+        float r = 13, gap = 32, x0 = cx - (n - 1) * gap * 0.5f, y = VIRT_H - 28;
+        for (int k = 0; k < n; k++) {
+            int id = ids[k];
+            bool lit = true;
+            if (id == MOD_PHOENIX) lit = !W.phoenix_used;
+            if (id == MOD_REACTIVE) lit = p->reactive_cd <= 0;
+            if (id == MOD_PHASE) lit = p->phase_cd <= 0;
+            if (id == MOD_OVERDRIVE || id == MOD_ADRENALINE) lit = G.reactor_dead;
+            if (id == MOD_ANCHOR) lit = p->mass > 1.15f;
+            if (id == MOD_LIFESUPPORT) lit = G.hostages_onboard > 0;
+            mod_draw_badge(id, v2(x0 + k * gap, y), r, 0.85f, lit);
+            if (R.mods[id] > 1) r_textf(x0 + k * gap + 10, y + 4, 7, col_a(C_WHITE, 0.8f), AL_LEFT, "%d", R.mods[id]);
+        }
     }
 
     hud_draw_messages();
@@ -371,6 +490,7 @@ void game_hud_draw(void) {
     /* death */
     if (p->dead && G.result == GR_NONE) {
         r_text_glow("SHIP DESTROYED", cx, VIRT_H * 0.42f, 34, C_RED, AL_CENTER);
+        r_textf(cx, VIRT_H * 0.42f - 26, 11, col_a(rgba(1, 0.6f, 0.55f, 1), 0.9f), AL_CENTER, "KILLED BY %s", game_killer_text());
         if (G.lives > 0) {
             r_textf(cx, VIRT_H * 0.42f + 56, 14, C_WHITE, AL_CENTER, "%d SHIP%s LEFT", G.lives, G.lives == 1 ? "" : "S");
             if (p->dead_t > 2.2f && fmodf(t * 2, 1) < 0.7f)
@@ -383,98 +503,12 @@ void game_hud_draw(void) {
         float a = clampf(G.escape_t / 0.6f, 0, 1);
         r_text_glow("ESCAPE SUCCESSFUL", cx, VIRT_H * 0.4f, 38, col_a(C_GREEN, a), AL_CENTER);
         r_textf(cx, VIRT_H * 0.4f + 60, 14, col_a(C_WHITE, a), AL_CENTER, "%d HOSTAGE%s RESCUED", G.hostages_onboard, G.hostages_onboard == 1 ? "" : "S");
+        r_textf(cx, VIRT_H * 0.4f + 86, 13, col_a(powerup_color(PU_SALVAGE), a), AL_CENTER, "%d CARGO BANKED", p->cargo);
+        if (G.escape_margin < 5)
+            r_text_glow(G.escape_margin < 1 ? "BY A HAIR!" : "CLOSE CALL!", cx, VIRT_H * 0.4f - 50, 22, col_a(C_YELLOW, a), AL_CENTER);
     }
     if (G.failing) {
         float a = clampf(G.fail_t / 1.0f, 0, 1);
         r_text_glow("CAUGHT IN THE BLAST", cx, VIRT_H * 0.42f, 36, col_a(C_RED, a), AL_CENTER);
     }
-}
-
-/* ------------------------------------------------------------ automap */
-void game_automap_draw(void) {
-    float VW = g_virt_w;
-    r_fill_rect(0, 0, VW, VIRT_H, rgba(0, 0.01f, 0.03f, 0.9f));
-    float mw = L.w * TILE, mh = L.h * TILE;
-    float fit = minf((VW - 120) / mw, (VIRT_H - 150) / mh);
-    float sc = fit * G.automap_zoom;
-    V2 center = v2add(v2(mw * 0.5f, mh * 0.5f), G.automap_pan);
-    V2 origin = v2(VW * 0.5f, VIRT_H * 0.5f + 10);
-#define AM(p) v2(origin.x + ((p).x - center.x) * sc, origin.y + ((p).y - center.y) * sc)
-    const LevelDef *d = cur_def();
-    float t = g_time;
-    /* explored floor tint */
-    for (int y = 0; y < L.h; y++)
-        for (int x = 0; x < L.w; x++) {
-            if (!L.explored[y][x]) continue;
-            V2 a = AM(v2(x * TILE, y * TILE));
-            Col fc = col_a(d->grid, 0.18f);
-            if (L.flags[y][x] & TF_ENERGY) fc = col_a(C_YELLOW, 0.35f);
-            if (L.flags[y][x] & TF_EXIT) fc = col_a(C_GREEN, 0.35f);
-            r_add_rect(a.x, a.y, TILE * sc + 0.5f, TILE * sc + 0.5f, fc);
-        }
-    for (int i = 0; i < L.nsegs; i++) {
-        const Seg *s = &L.segs[i];
-        V2 mid = v2mad(v2scale(v2add(s->a, s->b), 0.5f), s->n, 6);
-        int tx = tx_of(mid.x), ty = tx_of(mid.y);
-        V2 pa = v2mad(s->a, s->n, 1), pb = v2mad(s->b, s->n, 1);
-        int ax = tx_of(pa.x), ay = tx_of(pa.y), bx = tx_of(pb.x), by = tx_of(pb.y);
-        bool seen = (tile_in(tx, ty) && L.explored[ty][tx]) || (tile_in(ax, ay) && L.explored[ay][ax]) || (tile_in(bx, by) && L.explored[by][bx]);
-        if (!seen) continue;
-        r_line(AM(s->a), AM(s->b), 3.0f, s->tile >= 0 ? col_a(d->accent, 0.5f) : d->wall);
-    }
-    for (int i = 0; i < L.ndoors; i++) {
-        Door *dr = &L.doors[i];
-        bool seen = false;
-        for (int y = dr->y0 - 1; y <= dr->y1 + 1; y++)
-            for (int x = dr->x0 - 1; x <= dr->x1 + 1; x++)
-                if (tile_in(x, y) && L.explored[y][x]) seen = true;
-        if (!seen) continue;
-        Col c = key_color(dr->lock);
-        V2 a, b;
-        if (dr->horiz) { a = v2(dr->x0 * TILE, (dr->y0 + 0.5f) * TILE); b = v2((dr->x1 + 1) * TILE, (dr->y0 + 0.5f) * TILE); }
-        else { a = v2((dr->x0 + 0.5f) * TILE, dr->y0 * TILE); b = v2((dr->x0 + 0.5f) * TILE, (dr->y1 + 1) * TILE); }
-        r_line(AM(a), AM(b), 5, c);
-    }
-    /* points of interest */
-    for (int i = 0; i < W.nhost; i++) {
-        Hostage *h = &W.host[i];
-        if (!h->active || !L.explored[tx_of(h->pos.y)][tx_of(h->pos.x)]) continue;
-        V2 p = AM(h->pos);
-        r_circle(p, 4, 2.5f, C_GREEN, 10);
-    }
-    for (int i = 0; i < MAX_POWERUPS; i++) {
-        Powerup *pu = &W.pu[i];
-        if (!pu->active || pu->type < PU_KEY_BLUE) continue;
-        if (!L.explored[tx_of(pu->pos.y)][tx_of(pu->pos.x)]) continue;
-        V2 p = AM(pu->pos);
-        Col c = powerup_color(pu->type);
-        V2 dm[4] = {v2add(p, v2(0, -6)), v2add(p, v2(6, 0)), v2add(p, v2(0, 6)), v2add(p, v2(-6, 0))};
-        r_polyline(dm, 4, true, 3, c);
-    }
-    if (W.reactor.exists && L.explored[tx_of(W.reactor.pos.y)][tx_of(W.reactor.pos.x)]) {
-        V2 p = AM(W.reactor.pos);
-        r_circle(p, 8, 3, W.reactor.dead ? C_GREY : d->accent, 16);
-        r_text("REACTOR", p.x, p.y + 12, 8, d->accent, AL_CENTER);
-    }
-    for (int i = 0; i < W.nmat; i++) {
-        if (!L.explored[tx_of(W.mat[i].pos.y)][tx_of(W.mat[i].pos.x)]) continue;
-        V2 p = AM(W.mat[i].pos);
-        r_frame(p.x - 4, p.y - 4, 8, 8, 2.5f, C_MAGENTA);
-    }
-    if (G.reactor_dead) {
-        V2 p = AM(W.exit_pos);
-        r_text("EXIT", p.x, p.y - 16, 10, C_GREEN, AL_CENTER);
-    }
-    /* player */
-    Player *pl = &W.pl;
-    if (fmodf(t * 2, 1) < 0.75f) {
-        V2 p = AM(pl->pos);
-        game_draw_ship_icon(p, pl->ang, 8, C_WHITE);
-        r_glow(p, 20, col_a(C_CYAN, 0.5f));
-    }
-#undef AM
-    r_panel(20, 20, VW - 40, 50, d->wall, 0.6f);
-    r_textf(40, 34, 18, d->wall, AL_LEFT, "AUTOMAP - MINE %d: %s", G.level + 1, d->name);
-    r_text("TAB CLOSE   WASD PAN   WHEEL ZOOM", VW - 40, 40, 10, col_a(C_WHITE, 0.7f), AL_RIGHT);
-    r_text(objective_text(), VW * 0.5f, VIRT_H - 40, 12, col_a(C_WHITE, 0.8f), AL_CENTER);
 }

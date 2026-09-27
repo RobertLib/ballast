@@ -1,5 +1,5 @@
 /*
- * Renderer: batched additive "neon" geometry on top of SDL_Renderer,
+ * Renderer: batched additive glow geometry on top of SDL_Renderer,
  * a multi-resolution bloom post-process and a stroked vector font.
  */
 #include "common.h"
@@ -10,7 +10,7 @@ SDL_Renderer *g_ren;
 int g_pix_w = 1280, g_pix_h = 720;
 float g_scale = 1.0f;
 float g_virt_w = 1280.0f;
-Camera g_cam = {{0, 0}, 1.0f, {0, 0}};
+Camera g_cam = {{0, 0}, 1.0f, {0, 0}, {0, 0}};
 const char *g_screenshot_path = NULL;
 
 /* ---------------------------------------------------------------- rng */
@@ -43,7 +43,7 @@ static bool has_sub = false;
 static const float LU0 = 0.5f / ATLAS_W, LUM = 32.0f / ATLAS_W, LU1 = 63.5f / ATLAS_W;
 static const float GU0 = 64.5f / ATLAS_W, GU1 = 127.5f / ATLAS_W;
 static const float SU = 160.0f / ATLAS_W, SV = 0.5f;
-static const float AV0 = 0.5f / ATLAS_H, AV1 = 63.5f / ATLAS_H;
+static const float AV0 = 0.5f / ATLAS_H, AVM = 32.0f / ATLAS_H, AV1 = 63.5f / ATLAS_H;
 
 static SDL_Texture *make_atlas(SDL_BlendMode mode) {
     SDL_Surface *s = SDL_CreateSurface(ATLAS_W, ATLAS_H, SDL_PIXELFORMAT_RGBA32);
@@ -56,7 +56,7 @@ static SDL_Texture *make_atlas(SDL_BlendMode mode) {
             float dx = (lx + 0.5f - 32.0f) / 32.0f, dy = (y + 0.5f - 32.0f) / 32.0f;
             float d = sqrtf(dx * dx + dy * dy);
             if (x < 64) {
-                /* neon line profile: bright core + soft halo */
+                /* glow line profile: bright core + soft halo */
                 float core = 1.0f - smooth01((d - 0.16f) / 0.16f);
                 float halo = d < 1.0f ? 0.42f * powf(1.0f - d, 2.0f) : 0.0f;
                 a = maxf(core, halo);
@@ -198,15 +198,44 @@ static inline void use_tex(SDL_Texture *t, int needv, int needi) {
     if (nv + needv > MAXV || ni + needi > MAXI) r_flush();
 }
 
+/* the group transform of r_push: p * s + b, alpha multiplied */
+typedef struct { float sx, sy, bx, by, a; } Xform;
+#define XF_DEPTH 8
+static Xform xf_stack[XF_DEPTH];
+static int xf_n = 0;
+static Xform xf = {1, 1, 0, 0, 1};
+
+void r_push(V2 off, V2 org, float sx, float sy, float alpha) {
+    if (xf_n < XF_DEPTH) xf_stack[xf_n] = xf;
+    xf_n++;
+    /* the local transform org + (p - org) * s + off, then the parent's */
+    float lbx = org.x * (1 - sx) + off.x, lby = org.y * (1 - sy) + off.y;
+    xf.bx += lbx * xf.sx;
+    xf.by += lby * xf.sy;
+    xf.sx *= sx;
+    xf.sy *= sy;
+    xf.a *= alpha;
+}
+
+void r_pop(void) {
+    if (xf_n <= 0) return;
+    xf_n--;
+    if (xf_n < XF_DEPTH) xf = xf_stack[xf_n];
+}
+
 static inline int pv(V2 p, Col c, float u, float v) {
     SDL_Vertex *q = &vb[nv];
-    q->position.x = p.x * g_scale;
-    q->position.y = p.y * g_scale;
-    q->color.r = c.r; q->color.g = c.g; q->color.b = c.b; q->color.a = clampf(c.a, 0, 1);
+    q->position.x = (p.x * xf.sx + xf.bx) * g_scale;
+    q->position.y = (p.y * xf.sy + xf.by) * g_scale;
+    q->color.r = c.r; q->color.g = c.g; q->color.b = c.b; q->color.a = clampf(c.a * xf.a, 0, 1);
     q->tex_coord.x = u;
     q->tex_coord.y = v;
     return nv++;
 }
+
+/* polyline corners sharper than this (cos of half the turn) get a round outer join */
+#define MITER_MIN 0.5f
+#define JOIN_STEPS 6
 
 static inline void quad(int a, int b, int c, int d) {
     ib[ni++] = a; ib[ni++] = b; ib[ni++] = c;
@@ -214,6 +243,8 @@ static inline void quad(int a, int b, int c, int d) {
 }
 
 void render_begin(void) {
+    xf_n = 0;
+    xf = (Xform){1, 1, 0, 0, 1};
     SDL_SetRenderTarget(g_ren, scene);
     SDL_SetRenderDrawColorFloat(g_ren, 0, 0, 0, 1);
     SDL_RenderClear(g_ren);
@@ -273,7 +304,14 @@ void render_end(bool bloom, float strength) {
     if (g_screenshot_path) {
         SDL_Surface *s = SDL_RenderReadPixels(g_ren, NULL);
         if (s) {
-            SDL_SaveBMP(s, g_screenshot_path);
+            size_t n = strlen(g_screenshot_path);
+            bool png = n > 4 && !strcmp(g_screenshot_path + n - 4, ".png");
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+            if (png) SDL_SavePNG(s, g_screenshot_path);
+            else
+#endif
+                SDL_SaveBMP(s, g_screenshot_path);
+            (void)png;
             SDL_DestroySurface(s);
         }
         g_screenshot_path = NULL;
@@ -325,13 +363,13 @@ static void polyline_impl(const V2 *p, const Col *cols, Col base, int n, bool cl
         return;
     }
     float h = w * 0.5f;
-    int needv = n * 2 + 8, needi = (n + 2) * 6;
+    int needv = n * (JOIN_STEPS + 3) + 4, needi = n * (JOIN_STEPS + 4) * 3 + 12;
     if (needv > MAXV || needi > MAXI) return;
     use_tex(tex_add, needv, needi);
-    int first = nv;
+    /* vertex pairs (+ side, - side) ending the segment into a point and starting the one out of it */
+    int first_p = 0, first_m = 0, prev_p = 0, prev_m = 0;
     for (int i = 0; i < n; i++) {
         V2 cur = p[i];
-        V2 off;
         bool has_prev = closed || i > 0, has_next = closed || i < n - 1;
         V2 prev = p[(i - 1 + n) % n], next = p[(i + 1) % n];
         V2 d0 = has_prev ? v2norm(v2sub(cur, prev)) : v2norm(v2sub(next, cur));
@@ -344,31 +382,56 @@ static void polyline_impl(const V2 *p, const Col *cols, Col base, int n, bool cl
         if (ml < 1e-3f) m = n0;
         else m = v2scale(m, 1.0f / ml);
         float dm = v2dot(m, n0);
-        if (dm < 0.72f) dm = 0.72f;
-        off = v2scale(m, h / dm);
         Col c = cols ? cols[i] : base;
-        pv(v2add(cur, off), c, LUM, AV0);
-        pv(v2sub(cur, off), c, LUM, AV1);
+        int in_p, in_m, out_p, out_m;
+        if (dm >= MITER_MIN) {
+            V2 off = v2scale(m, h / dm);
+            in_p = out_p = pv(v2add(cur, off), c, LUM, AV0);
+            in_m = out_m = pv(v2sub(cur, off), c, LUM, AV1);
+        } else {
+            /* sharp corner: exact miter on the inner side, round join on the outer one,
+             * so both edges keep their full width and the corner stays symmetric */
+            float s = v2cross(d0, d1) > 0 ? 1.0f : -1.0f;
+            float reach = minf(h / maxf(dm, 0.2f), minf(v2dist(cur, prev), v2dist(cur, next)));
+            float v_in = s > 0 ? AV0 : AV1, v_out = s > 0 ? AV1 : AV0;
+            int inner = pv(v2add(cur, v2scale(m, s * reach)), c, LUM, v_in);
+            int centre = pv(cur, c, LUM, AVM);
+            float turn = atan2f(v2cross(d0, d1), v2dot(d0, d1));
+            V2 r0 = v2scale(n0, -s * h);
+            int o0 = pv(v2add(cur, r0), c, LUM, v_out), ok = o0;
+            for (int k = 1; k <= JOIN_STEPS; k++) {
+                int o = pv(v2add(cur, v2rot(r0, turn * k / JOIN_STEPS)), c, LUM, v_out);
+                ib[ni++] = centre; ib[ni++] = ok; ib[ni++] = o;
+                ok = o;
+            }
+            ib[ni++] = centre; ib[ni++] = inner; ib[ni++] = o0;
+            ib[ni++] = centre; ib[ni++] = ok; ib[ni++] = inner;
+            if (s > 0) { in_p = out_p = inner; in_m = o0; out_m = ok; }
+            else { in_m = out_m = inner; in_p = o0; out_p = ok; }
+        }
+        if (i == 0) {
+            first_p = in_p;
+            first_m = in_m;
+        } else {
+            quad(prev_p, in_p, in_m, prev_m);
+        }
+        prev_p = out_p;
+        prev_m = out_m;
     }
-    int segs = closed ? n : n - 1;
-    for (int i = 0; i < segs; i++) {
-        int a = first + i * 2, b = first + ((i + 1) % n) * 2;
-        quad(a, b, b + 1, a + 1);
-    }
+    if (closed) quad(prev_p, first_p, first_m, prev_m);
     if (!closed) {
         V2 d = v2norm(v2sub(p[1], p[0]));
         V2 nn = v2scale(v2perp(d), h), dh = v2scale(d, h);
         Col c0 = cols ? cols[0] : base;
         int e0 = pv(v2add(v2sub(p[0], dh), nn), c0, LU0, AV0);
         int e1 = pv(v2sub(v2sub(p[0], dh), nn), c0, LU0, AV1);
-        quad(e0, first, first + 1, e1);
+        quad(e0, first_p, first_m, e1);
         d = v2norm(v2sub(p[n - 1], p[n - 2]));
         nn = v2scale(v2perp(d), h); dh = v2scale(d, h);
         Col c1 = cols ? cols[n - 1] : base;
-        int last = first + (n - 1) * 2;
         int f0 = pv(v2add(v2add(p[n - 1], dh), nn), c1, LU1, AV0);
         int f1 = pv(v2sub(v2add(p[n - 1], dh), nn), c1, LU1, AV1);
-        quad(last, f0, f1, last + 1);
+        quad(prev_p, f0, f1, prev_m);
     }
 }
 
@@ -422,6 +485,14 @@ void r_fill_tri(V2 a, V2 b, V2 c, Col col) {
     ib[ni++] = pv(b, col, SU, SV);
     ib[ni++] = pv(c, col, SU, SV);
 }
+/* solid triangles with a colour per vertex, blended smoothly across each one */
+void r_mesh(const V2 *pts, const Col *cols, int npts, const int *idx, int nidx) {
+    if (npts > MAXV || nidx > MAXI) return;
+    use_tex(tex_blend, npts, nidx);
+    int base = nv;
+    for (int i = 0; i < npts; i++) pv(pts[i], cols[i], SU, SV);
+    for (int i = 0; i < nidx; i++) ib[ni++] = base + idx[i];
+}
 void r_add_quad(V2 a, V2 b, V2 c, V2 d, Col col) {
     use_tex(tex_add, 4, 6);
     int i0 = pv(a, col, SU, SV), i1 = pv(b, col, SU, SV), i2 = pv(c, col, SU, SV), i3 = pv(d, col, SU, SV);
@@ -429,6 +500,15 @@ void r_add_quad(V2 a, V2 b, V2 c, V2 d, Col col) {
 }
 void r_add_rect(float x, float y, float w, float h, Col c) {
     r_add_quad(v2(x, y), v2(x + w, y), v2(x + w, y + h), v2(x, y + h), c);
+}
+void r_add_hband(float x, float y, float w, float h, Col c) {
+    use_tex(tex_add, 6, 12);
+    Col z = col_a(c, 0);
+    int a0 = pv(v2(x, y), z, SU, SV), a1 = pv(v2(x, y + h), z, SU, SV);
+    int b0 = pv(v2(x + w * 0.5f, y), c, SU, SV), b1 = pv(v2(x + w * 0.5f, y + h), c, SU, SV);
+    int c0 = pv(v2(x + w, y), z, SU, SV), c1 = pv(v2(x + w, y + h), z, SU, SV);
+    quad(a0, b0, b1, a1);
+    quad(b0, c0, c1, b1);
 }
 void r_rock_quad(V2 a, V2 b, V2 c, V2 d, V2 ua, V2 ub, V2 uc, V2 ud, Col col) {
     use_tex(tex_rock, 4, 6);
@@ -605,12 +685,47 @@ float text_width(const char *s, float size) {
     return (best * GLYPH_ADV - 1.6f) * u;
 }
 
-static void text_impl(const char *s, float x, float y, float size, Col c, int align, float wmul) {
+/* the first k (0..1) of a polyline's length, with a bright pen at the tip */
+static void polyline_part(const V2 *p, int n, float k, float w, Col c, bool pen) {
+    if (k <= 0 || n < 1) return;
+    if (n == 1) {
+        r_line(p[0], p[0], w, c);
+        return;
+    }
+    if (k >= 1) {
+        r_polyline(p, n, false, w, c);
+        return;
+    }
+    float want = 0;
+    for (int i = 1; i < n; i++) want += v2dist(p[i - 1], p[i]);
+    want *= k;
+    V2 tmp[40];
+    int m = 0;
+    tmp[m++] = p[0];
+    for (int i = 1; i < n && m < 40; i++) {
+        float l = v2dist(p[i - 1], p[i]);
+        if (want <= l) {
+            tmp[m++] = v2lerp(p[i - 1], p[i], l > 0 ? want / l : 1);
+            break;
+        }
+        want -= l;
+        tmp[m++] = p[i];
+    }
+    if (m >= 2) r_polyline(tmp, m, false, w, c);
+    if (pen) r_glow(tmp[m - 1], w * 2.4f, col_a(col_white(c, 0.6f), 0.7f * c.a));
+}
+
+/* reveal < 0 draws the whole text; 0..1 draws the glyphs on stroke by stroke, left to right */
+static void text_impl(const char *s, float x, float y, float size, Col c, int align, float wmul, float reveal) {
     if (!font_ready) font_init();
     float u = size / 6.0f;
     float lw = maxf(2.2f, size * 0.30f) * wmul;
     float cx = x;
     float lx = x;
+    int nglyph = 0, gi = 0;
+    if (reveal >= 0)
+        for (const char *q = s; *q; q++) nglyph += *q != ' ' && *q != '\n';
+    const float span = 0.35f;
     /* per-line alignment */
     const char *line = s;
     while (line && *line) {
@@ -626,14 +741,21 @@ static void text_impl(const char *s, float x, float y, float size, Col c, int al
             if (ch >= 'a' && ch <= 'z') ch -= 32;
             if (ch < 32 || ch >= 128) ch = '?';
             const Glyph *g = &glyphs[ch - 32];
-            for (int k = 0; k < g->ns; k++) {
+            float kg = 1;
+            if (reveal >= 0 && ch != ' ') {
+                float st = nglyph > 1 ? (float)gi / (nglyph - 1) * (1 - span) : 0;
+                kg = clampf((reveal - st) / span, 0, 1);
+                gi++;
+            }
+            for (int k = 0; k < g->ns && kg > 0; k++) {
                 V2 tmp[40];
                 int n = g->len[k];
                 for (int j = 0; j < n; j++) {
                     V2 q = g->pts[g->start[k] + j];
                     tmp[j] = v2(cx + q.x * u, y + q.y * u);
                 }
-                if (n == 1) r_line(tmp[0], tmp[0], lw, c);
+                if (kg < 1) polyline_part(tmp, n, kg, lw, c, wmul == 1.0f);
+                else if (n == 1) r_line(tmp[0], tmp[0], lw, c);
                 else r_polyline(tmp, n, false, lw, c);
             }
             cx += GLYPH_ADV * u;
@@ -643,11 +765,29 @@ static void text_impl(const char *s, float x, float y, float size, Col c, int al
     }
 }
 
-void r_text(const char *s, float x, float y, float size, Col c, int align) { text_impl(s, x, y, size, c, align, 1.0f); }
+void r_text(const char *s, float x, float y, float size, Col c, int align) { text_impl(s, x, y, size, c, align, 1.0f, -1); }
 
-void r_text_glow(const char *s, float x, float y, float size, Col c, int align) {
-    text_impl(s, x, y, size, col_a(c, 0.35f), align, 2.6f);
-    text_impl(s, x, y, size, c, align, 1.0f);
+void r_text_glow(const char *s, float x, float y, float size, Col c, int align) { r_text_glowk(s, x, y, size, c, align, 1); }
+
+void r_text_glowk(const char *s, float x, float y, float size, Col c, int align, float glow) {
+    if (glow > 0.01f) text_impl(s, x, y, size, col_a(c, 0.35f * glow), align, 2.6f, -1);
+    text_impl(s, x, y, size, c, align, 1.0f, -1);
+}
+
+void r_text_reveal(const char *s, float x, float y, float size, Col c, int align, float k, bool glow) {
+    if (glow) text_impl(s, x, y, size, col_a(c, 0.35f), align, 2.6f, clampf(k, 0, 1));
+    text_impl(s, x, y, size, c, align, 1.0f, clampf(k, 0, 1));
+}
+
+int font_glyph(int ch, const V2 **pts, const int **start, const int **len) {
+    if (!font_ready) font_init();
+    if (ch >= 'a' && ch <= 'z') ch -= 32;
+    if (ch < 32 || ch >= 128) ch = '?';
+    const Glyph *g = &glyphs[ch - 32];
+    *pts = g->pts;
+    *start = g->start;
+    *len = g->len;
+    return g->ns;
 }
 
 void r_textf(float x, float y, float size, Col c, int align, const char *fmt, ...) {

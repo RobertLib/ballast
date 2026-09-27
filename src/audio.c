@@ -1,6 +1,6 @@
 /*
- * Audio: all sound effects are synthesized at startup, music is a small
- * real-time synthwave sequencer running inside the audio callback.
+ * Audio: all sound effects are synthesized at startup and mixed here together
+ * with the music, which is synthesized in real time by music.c.
  */
 #include "common.h"
 
@@ -362,252 +362,6 @@ static void gen_sounds(void) {
 #undef T
 }
 
-/* ------------------------------------------------------------ music */
-typedef struct {
-    float bpm;
-    int root;
-    int nbars;
-    int chords[8];
-    int qual[8];
-    uint16_t kick, snare, hat, ohat;
-    int8_t bass[16];
-    int8_t arp[16];
-    int8_t lead[32];
-    float bass_v, arp_v, pad_v, drum_v, lead_v;
-    float bass_cut;
-    float arp_decay;
-    int arp_oct;
-} Song;
-
-#define R -1
-#define H -2
-static const Song SONGS[SONG_COUNT] = {
-    /* MENU: A minor, slow and atmospheric */
-    {92, 45, 8, {0, -4, 3, -2, 0, -4, 3, -2}, {0, 1, 1, 1, 0, 1, 1, 1},
-     0x0101, 0x1000, 0x4444, 0x0000,
-     {0, R, R, R, R, R, R, R, 0, R, R, R, R, R, 7, R},
-     {0, R, 2, R, 3, R, 2, R, 1, R, 2, R, 4, R, 2, R},
-     {R}, 0.8f, 0.45f, 0.55f, 0.5f, 0.0f, 0.04f, 7.0f, 0},
-    /* L1: D minor, driving */
-    {118, 38, 8, {0, -4, -2, -5, 0, -4, -2, 2}, {0, 1, 1, 0, 0, 1, 1, 1},
-     0x1111, 0x1010, 0x4444, 0x0000,
-     {0, R, 0, 12, 0, R, 7, 12, 0, R, 0, 12, 0, R, 10, 12},
-     {0, 1, 2, 3, 4, 3, 2, 1, 0, 1, 2, 3, 5, 3, 2, 1},
-     {R}, 0.9f, 0.32f, 0.35f, 0.8f, 0.0f, 0.06f, 10.0f, 0},
-    /* L2: E minor, offbeat techno bass */
-    {124, 40, 8, {0, -4, -2, -5, 0, -4, -2, -1}, {0, 1, 1, 0, 0, 1, 1, 1},
-     0x1111, 0x1010, 0x5555, 0x4444,
-     {R, R, 0, R, R, R, 0, R, R, R, 0, R, R, 12, 0, R},
-     {0, 2, 3, 2, 1, 2, 4, 2, 0, 2, 3, 2, 5, 4, 3, 2},
-     {R}, 1.0f, 0.3f, 0.3f, 0.8f, 0.0f, 0.07f, 12.0f, 0},
-    /* L3: C minor, 16th bass */
-    {130, 36, 8, {0, -4, 3, -2, 0, -4, 3, -1}, {0, 1, 1, 1, 0, 1, 1, 1},
-     0x1111, 0x1010, 0xFFFF, 0x0000,
-     {0, 0, 12, 0, 0, 12, 0, 0, 0, 0, 12, 0, 7, 0, 12, 10},
-     {3, R, 2, R, 1, R, 2, R, 3, R, 4, R, 5, R, 4, R},
-     {R}, 0.85f, 0.3f, 0.35f, 0.8f, 0.0f, 0.05f, 9.0f, 12},
-    /* BOSS: F minor / harmonic */
-    {140, 41, 4, {0, -4, -2, -5}, {0, 1, 1, 1},
-     0x1111, 0x1010, 0xFFFF, 0x2222,
-     {0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 12, 0, 13, 0, 12, 11},
-     {0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 5, 4, 3, 2},
-     {12, H, H, H, 15, H, 14, H, 12, H, H, H, 11, H, H, H, 12, H, H, H, 15, H, 17, H, 19, H, H, H, 17, H, 15, H},
-     1.0f, 0.25f, 0.3f, 0.9f, 0.22f, 0.07f, 12.0f, 0},
-    /* ESCAPE: G minor, fast */
-    {164, 43, 4, {0, -4, -2, -5}, {0, 1, 1, 1},
-     0x1111, 0x1010, 0xFFFF, 0x0000,
-     {0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 0, 12, 7, 12},
-     {0, 1, 2, 3, 4, 5, 4, 3, 2, 1, 2, 3, 4, 5, 4, 3},
-     {24, H, 22, H, 19, H, 22, H, 24, H, 26, H, 27, H, 26, H, 24, H, 22, H, 19, H, 17, H, 18, H, H, H, 19, H, H, H},
-     0.9f, 0.3f, 0.2f, 0.9f, 0.2f, 0.09f, 16.0f, 0},
-    /* BRIEF: G major, calm */
-    {84, 43, 4, {0, -3, -7, -5}, {1, 0, 1, 1},
-     0x0101, 0x0000, 0x0000, 0x4444,
-     {0, R, R, R, R, R, R, R, 7, R, R, R, R, R, R, R},
-     {0, R, R, 2, R, R, 3, R, R, 4, R, R, 2, R, R, R},
-     {R}, 0.6f, 0.4f, 0.6f, 0.35f, 0.0f, 0.035f, 5.0f, 0},
-    /* GAMEOVER */
-    {70, 45, 4, {0, 5, 7, 0}, {0, 0, 1, 0},
-     0x0001, 0x0000, 0x0000, 0x0000,
-     {0, R, R, R, R, R, R, R, R, R, R, R, R, R, R, R},
-     {0, R, R, R, 2, R, R, R, 3, R, R, R, 1, R, R, R},
-     {R}, 0.6f, 0.35f, 0.7f, 0.3f, 0.0f, 0.03f, 3.0f, 0},
-    /* VICTORY: C major, uplifting */
-    {112, 48, 4, {0, 7, 9, 5}, {1, 1, 0, 1},
-     0x1111, 0x1010, 0x4444, 0x0000,
-     {0, R, 12, R, 0, R, 12, R, 0, R, 12, R, 7, R, 12, R},
-     {0, 1, 2, 3, 4, 3, 2, 1, 0, 1, 2, 3, 5, 4, 3, 2},
-     {12, H, H, H, 16, H, 19, H, 24, H, H, H, 23, H, 19, H, 21, H, H, H, 19, H, 16, H, 17, H, H, H, 16, H, 14, H},
-     0.8f, 0.35f, 0.45f, 0.75f, 0.18f, 0.06f, 8.0f, 0},
-};
-#undef R
-#undef H
-
-static const int TONES[2][6] = {{0, 3, 7, 12, 15, 19}, {0, 4, 7, 12, 16, 19}};
-
-typedef struct {
-    int song, target;
-    float gain;
-    int step, bar;
-    double step_left;
-    /* bass */
-    float b_freq, b_ph, b_sub, b_env, b_lp1, b_lp2;
-    /* arp */
-    float a_freq, a_ph, a_env, a_lp;
-    /* pad */
-    float p_freq[3], p_ph[3][2], p_env, p_lp_l, p_lp_r;
-    /* lead */
-    float l_freq, l_ph, l_env, l_vib;
-    bool l_on;
-    /* drums */
-    float k_env, k_ph, k_penv;
-    float s_env, s_ph, s_hp;
-    float h_env, h_hp, h_len;
-    float n_prev;
-    /* delay */
-    float *dl, *dr;
-    int dlen, dpos;
-} MusicState;
-static MusicState M;
-
-static inline float mtof(int n) { return 440.0f * powf(2.0f, (n - 69) / 12.0f); }
-
-static void music_trigger(void) {
-    const Song *s = &SONGS[M.song];
-    int bar = M.bar % s->nbars;
-    int chord = s->chords[bar], q = s->qual[bar];
-    int st = M.step;
-    if (s->kick & (1 << st)) { M.k_env = 1; M.k_ph = 0; M.k_penv = 1; }
-    if (s->snare & (1 << st)) { M.s_env = 1; }
-    if (s->hat & (1 << st)) { M.h_env = 0.7f; M.h_len = 60; }
-    if (s->ohat & (1 << st)) { M.h_env = 0.6f; M.h_len = 12; }
-    if (s->bass[st] >= 0 && s->bass_v > 0) {
-        M.b_freq = mtof(s->root + chord + s->bass[st]);
-        M.b_env = 1;
-    }
-    if (s->arp[st] >= 0 && s->arp_v > 0) {
-        M.a_freq = mtof(s->root + 24 + s->arp_oct + chord + TONES[q][s->arp[st]]);
-        M.a_env = 1;
-    }
-    if (st == 0 && s->pad_v > 0) {
-        for (int k = 0; k < 3; k++) M.p_freq[k] = mtof(s->root + 12 + chord + TONES[q][k]);
-    }
-    if (s->lead_v > 0) {
-        int lv = s->lead[(bar % 2) * 16 + st];
-        if (lv >= 0) { M.l_freq = mtof(s->root + 12 + lv); M.l_env = 1; M.l_on = true; }
-        else if (lv == -1) M.l_on = false;
-    }
-}
-
-static void music_render(float *out, int frames) {
-    if (M.song < 0 && M.target < 0) return;
-    for (int i = 0; i < frames; i++) {
-        /* crossfade handling */
-        if (M.target != M.song) {
-            M.gain -= 1.0f / (RATE * 0.7f);
-            if (M.gain <= 0 || M.song < 0) {
-                M.gain = 0;
-                M.song = M.target;
-                M.step = 15; M.bar = -1; M.step_left = 0;
-                M.a_env = M.b_env = M.l_env = 0;
-                M.l_on = false;
-            }
-        } else if (M.gain < 1) {
-            M.gain = minf(1, M.gain + 1.0f / (RATE * 0.5f));
-        }
-        if (M.song < 0) continue;
-        const Song *s = &SONGS[M.song];
-        M.step_left -= 1.0;
-        if (M.step_left <= 0) {
-            M.step_left += RATE * 60.0 / s->bpm / 4.0;
-            M.step = (M.step + 1) % 16;
-            if (M.step == 0) M.bar = (M.bar + 1) % s->nbars;
-            music_trigger();
-        }
-        float L = 0, Rr = 0;
-        /* bass: saw + sub through 2-pole lowpass with envelope */
-        M.b_ph += M.b_freq / RATE;
-        M.b_sub += M.b_freq * 0.5f / RATE;
-        float bv = 0.55f * o_saw(M.b_ph) + 0.5f * o_sin(M.b_sub);
-        float cut = s->bass_cut + 0.25f * M.b_env;
-        M.b_lp1 += cut * (bv - M.b_lp1);
-        M.b_lp2 += cut * (M.b_lp1 - M.b_lp2);
-        float bass = M.b_lp2 * M.b_env * s->bass_v;
-        M.b_env *= 1.0f - 6.0f / RATE;
-        L += bass; Rr += bass;
-        /* arp: pulse wave */
-        M.a_ph += M.a_freq / RATE;
-        float av = 0.6f * o_pulse(M.a_ph, 0.3f) + 0.4f * o_tri(M.a_ph);
-        M.a_lp += 0.3f * (av - M.a_lp);
-        float arp = M.a_lp * M.a_env * s->arp_v;
-        M.a_env *= 1.0f - s->arp_decay / RATE;
-        /* pad: detuned saws */
-        float pl = 0, pr = 0;
-        if (s->pad_v > 0) {
-            for (int k = 0; k < 3; k++) {
-                M.p_ph[k][0] += M.p_freq[k] * 0.9965f / RATE;
-                M.p_ph[k][1] += M.p_freq[k] * 1.0035f / RATE;
-                pl += o_saw(M.p_ph[k][0]);
-                pr += o_saw(M.p_ph[k][1]);
-            }
-            M.p_lp_l += 0.03f * (pl - M.p_lp_l);
-            M.p_lp_r += 0.03f * (pr - M.p_lp_r);
-            float pv = s->pad_v * 0.16f;
-            L += M.p_lp_l * pv;
-            Rr += M.p_lp_r * pv;
-        }
-        /* lead */
-        if (s->lead_v > 0) {
-            M.l_vib += 5.5f / RATE;
-            float f = M.l_freq * (1.0f + 0.006f * o_sin(M.l_vib));
-            M.l_ph += f / RATE;
-            float target = M.l_on ? 1.0f : 0.0f;
-            M.l_env += (target - M.l_env) * (M.l_on ? 0.002f : 0.0006f);
-            float lv = (0.5f * o_saw(M.l_ph) + 0.5f * o_sq(M.l_ph * 0.5f + 0.25f)) * M.l_env * s->lead_v;
-            L += lv * 0.8f; Rr += lv * 0.8f;
-            arp += lv * 0.3f;
-        }
-        /* drums */
-        float nz = o_noise();
-        float dr = 0;
-        if (M.k_env > 0.0005f) {
-            float f = 45 + 120 * M.k_penv;
-            M.k_ph += f / RATE;
-            dr += o_sin(M.k_ph) * M.k_env * 1.1f;
-            M.k_env *= 1.0f - 9.0f / RATE;
-            M.k_penv *= 1.0f - 38.0f / RATE;
-        }
-        if (M.s_env > 0.0005f) {
-            M.s_hp = nz - M.n_prev;
-            M.s_ph += 185.0f / RATE;
-            dr += (M.s_hp * 0.45f + o_sin(M.s_ph) * 0.35f) * M.s_env;
-            M.s_env *= 1.0f - 16.0f / RATE;
-        }
-        float hat = 0;
-        if (M.h_env > 0.0005f) {
-            float hp = nz - M.n_prev;
-            hat = hp * M.h_env * 0.22f;
-            M.h_env *= 1.0f - M.h_len / RATE;
-        }
-        M.n_prev = nz;
-        dr *= s->drum_v;
-        hat *= s->drum_v;
-        L += dr + hat * 0.7f;
-        Rr += dr + hat;
-        /* arp through ping-pong delay */
-        int dp = M.dpos;
-        float echo_l = M.dl[dp], echo_r = M.dr[dp];
-        M.dl[dp] = arp + echo_r * 0.45f;
-        M.dr[dp] = echo_l * 0.45f;
-        M.dpos = (dp + 1) % M.dlen;
-        L += arp + echo_l * 0.6f;
-        Rr += arp * 0.8f + echo_r * 0.6f;
-        float g = M.gain * vol_music * 0.42f;
-        out[i * 2] += L * g;
-        out[i * 2 + 1] += Rr * g;
-    }
-}
-
 /* ------------------------------------------------------------ mixer */
 static inline float soft_clip(float x) {
     if (x > 3) return 1;
@@ -644,7 +398,7 @@ static void SDLCALL audio_cb(void *userdata, SDL_AudioStream *st, int additional
                 }
             }
         }
-        music_render(buf, frames);
+        music_render(buf, frames, vol_music);
         SDL_UnlockMutex(mtx);
         for (int i = 0; i < frames * 2; i++) buf[i] = soft_clip(buf[i]);
         SDL_PutAudioStreamData(st, buf, frames * (int)sizeof(float) * 2);
@@ -654,11 +408,7 @@ static void SDLCALL audio_cb(void *userdata, SDL_AudioStream *st, int additional
 
 void audio_init(void) {
     gen_sounds();
-    memset(&M, 0, sizeof(M));
-    M.song = M.target = -1;
-    M.dlen = (int)(RATE * 0.36f);
-    M.dl = (float *)calloc((size_t)M.dlen, sizeof(float));
-    M.dr = (float *)calloc((size_t)M.dlen, sizeof(float));
+    music_init();
     mtx = SDL_CreateMutex();
     SDL_AudioSpec spec;
     spec.format = SDL_AUDIO_F32;
@@ -679,8 +429,7 @@ void audio_shutdown(void) {
     if (mtx) SDL_DestroyMutex(mtx);
     mtx = NULL;
     for (int i = 0; i < SND_COUNT; i++) free(S[i].d);
-    free(M.dl);
-    free(M.dr);
+    music_shutdown();
 }
 
 static Voice *alloc_voice(int id) {
@@ -770,7 +519,7 @@ void audio_set_listener(V2 p) { listener = p; }
 void music_play(int song) {
     if (!audio_ok) return;
     SDL_LockMutex(mtx);
-    M.target = song;
+    music_request(song);
     SDL_UnlockMutex(mtx);
 }
 

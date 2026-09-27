@@ -1,0 +1,21 @@
+# Build output (make)
+/build/
+/ballast
+
+# Build output (CMake)
+/build-*/
+/cmake-build-*/
+
+# Compiled objects and debug symbols
+*.o
+*.obj
+*.exe
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp

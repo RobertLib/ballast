@@ -1,11 +1,11 @@
-# NEON DESCENT - build with `make`, run with `make run`
+# BALLAST - build with `make`, run with `make run`
 CC      ?= cc
 CFLAGS  ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 CFLAGS  += $(shell pkg-config --cflags sdl3)
 LDLIBS  += $(shell pkg-config --libs sdl3) -lm
 SRC     := $(wildcard src/*.c)
 OBJ     := $(SRC:src/%.c=build/%.o)
-BIN     := neon_descent
+BIN     := ballast
 
 all: $(BIN)
 

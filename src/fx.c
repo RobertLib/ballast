@@ -53,9 +53,38 @@ void grid_impulse(V2 p, float radius, float strength) {
         }
 }
 
+/* a body moving over the grid shoves the nodes out of its way, harder the faster it goes;
+ * they spring back behind it, so it leaves a rippling wake */
+void grid_wake(V2 p, V2 vel, float radius, float strength, float dt) {
+    if (!gd) return;
+    float sp = v2len(vel);
+    if (sp < 12.0f) return;
+    V2 fwd = v2scale(vel, 1.0f / sp);
+    float k = strength * minf(sp / 320.0f, 1.6f) * dt;
+    /* the bow wave sits a little ahead of the body */
+    V2 c = v2mad(p, fwd, radius * 0.2f);
+    int x0 = clampi((int)((c.x - radius) / gsp), 1, gw - 2), x1 = clampi((int)((c.x + radius) / gsp) + 1, 1, gw - 2);
+    int y0 = clampi((int)((c.y - radius) / gsp), 1, gh - 2), y1 = clampi((int)((c.y + radius) / gsp) + 1, 1, gh - 2);
+    float r2 = radius * radius;
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) {
+            int i = y * gw + x;
+            V2 d = v2sub(v2(x * gsp, y * gsp), c);
+            float d2 = v2len2(d);
+            if (d2 >= r2 || d2 < 1e-4f) continue;
+            float dist = sqrtf(d2);
+            V2 dir = v2scale(d, 1.0f / dist);
+            float f = 1.0f - dist / radius;
+            /* out to the sides and ahead; the nodes it has passed get dragged along a little */
+            float side = v2cross(fwd, dir), along = v2dot(fwd, dir);
+            V2 push = v2add(v2scale(v2perp(fwd), side * 1.3f), v2scale(fwd, maxf(along, 0) * 0.8f + 0.25f));
+            gv[i] = v2mad(gv[i], push, k * f * f);
+        }
+}
+
 void grid_update(float dt) {
     if (!gd) return;
-    const float K = 55.0f, A = 14.0f, D = 4.5f;
+    const float K = 55.0f, A = 14.0f, D = 3.2f;
     float lim = gsp * 0.85f;
     /* only simulate around the camera: the rest settles naturally */
     int cx = (int)(g_cam.pos.x / gsp), cy = (int)(g_cam.pos.y / gsp);
